@@ -1,0 +1,38 @@
+# Virtual environment
+rental_backend/venv/
+venv/
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Django
+*.log
+local_settings.py
+db.sqlite3
+media/
+staticfiles/
+*.pot
+
+# Firebase / secrets (do not commit keys)
+*firebase*adminsdk*.json
+!*firebase*adminsdk*.json.example
+
+# OS
+.DS_Store
+Thumbs.db

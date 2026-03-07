@@ -1,0 +1,194 @@
+{% extends "admin/base_site.html" %}
+{% load i18n %}
+
+{% block extrahead %}
+{{ block.super }}
+<style>
+  .bulk-dates-section { margin: 1rem 0; padding: 1rem; background: #f8f9fa; border-radius: 8px; border: 1px solid #e0e0e0; }
+  .bulk-dates-section label { font-weight: 600; display: block; margin-bottom: 0.5rem; }
+  .multi-date-row { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
+  .multi-date-row input[type="date"] { padding: 6px 10px; }
+  .multi-date-row .add-date-btn { padding: 6px 14px; background: #417690; color: white; border: none; border-radius: 4px; cursor: pointer; }
+  .multi-date-row .add-date-btn:hover { background: #205067; }
+  .dates-chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; min-height: 42px; align-items: center; }
+  .date-chip { display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; background: #e3f2fd; border: 1px solid #2196f3; border-radius: 20px; font-size: 13px; }
+  .date-chip .remove-chip { cursor: pointer; color: #c62828; font-weight: bold; padding: 0 4px; line-height: 1; }
+  .date-chip .remove-chip:hover { color: #b71c1c; }
+  .range-toggle-row { margin: 1rem 0; }
+  .range-toggle-row label { display: inline; font-weight: normal; margin-left: 6px; }
+  .range-fields { margin-top: 12px; padding: 12px; background: #fff; border-radius: 6px; border: 1px solid #ddd; }
+  .range-fields .form-row { margin-bottom: 10px; }
+  .fill-range-btn { padding: 6px 14px; background: #2e7d32; color: white; border: none; border-radius: 4px; cursor: pointer; margin-top: 8px; }
+  .fill-range-btn:hover { background: #1b5e20; }
+  #id_dates { display: none; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div id="content-main">
+  <h1>{{ title }}</h1>
+  <p style="margin-bottom: 20px; color: #666;">
+    Select an artist and <strong>one or more dates</strong>. Pick dates individually with the date picker, or turn on &quot;Use date range&quot; to fill a range. Then choose status (Blocked / Booked / Available) and click Apply.
+  </p>
+
+  <form method="post" id="bulk-availability-form">
+    {% csrf_token %}
+
+    {% if form.non_field_errors %}
+      <ul class="errorlist">{{ form.non_field_errors }}</ul>
+    {% endif %}
+
+    <fieldset class="module aligned">
+      <div class="form-row">
+        <div>
+          <label for="id_artist">Artist / Service:</label>
+          {{ form.artist }}
+          {% if form.artist.help_text %}<p class="help">{{ form.artist.help_text }}</p>{% endif %}
+          {{ form.artist.errors }}
+        </div>
+      </div>
+
+      <!-- Select Dates: multi-date picker + chips -->
+      <div class="form-row bulk-dates-section">
+        <label>Select dates</label>
+        <div class="multi-date-row">
+          <input type="date" id="picker-date" />
+          <button type="button" class="add-date-btn" id="add-date-btn">Add date</button>
+        </div>
+        <div class="dates-chips" id="dates-chips"></div>
+        {{ form.dates }}
+        {{ form.dates.errors }}
+      </div>
+
+      <!-- Use date range toggle -->
+      <div class="form-row range-toggle-row">
+        <input type="checkbox" name="use_date_range" id="id_use_date_range" {% if form.use_date_range.value %}checked{% endif %} />
+        <label for="id_use_date_range">Use date range</label>
+      </div>
+      <div class="range-fields" id="range-fields">
+        <div class="form-row">
+          <label for="id_date_from">From date:</label>
+          <input type="date" name="date_from" id="id_date_from" value="{{ form.date_from.value|default:'' }}" />
+          <p class="help">{{ form.date_from.help_text }}</p>
+          {{ form.date_from.errors }}
+        </div>
+        <div class="form-row">
+          <label for="id_date_to">To date:</label>
+          <input type="date" name="date_to" id="id_date_to" value="{{ form.date_to.value|default:'' }}" />
+          <p class="help">{{ form.date_to.help_text }}</p>
+          {{ form.date_to.errors }}
+        </div>
+        <button type="button" class="fill-range-btn" id="fill-range-btn">Fill from range</button>
+      </div>
+
+      <div class="form-row">
+        <div>
+          <label for="id_status">Status:</label>
+          {{ form.status }}
+          {% if form.status.help_text %}<p class="help">{{ form.status.help_text }}</p>{% endif %}
+          {{ form.status.errors }}
+        </div>
+      </div>
+      <div class="form-row">
+        <div>
+          <label for="id_service_type">Service type:</label>
+          {{ form.service_type }}
+          {% if form.service_type.help_text %}<p class="help">{{ form.service_type.help_text }}</p>{% endif %}
+          {{ form.service_type.errors }}
+        </div>
+      </div>
+      <div class="form-row">
+        <div>
+          <label for="id_notes">Notes (optional):</label>
+          {{ form.notes }}
+          {{ form.notes.errors }}
+        </div>
+      </div>
+    </fieldset>
+
+    <div class="submit-row">
+      <input type="submit" value="Apply to selected dates" class="default">
+      <a href="{% url 'admin:backend_artistavailability_changelist' %}" class="button cancel-link">Cancel</a>
+    </div>
+  </form>
+</div>
+
+<script>
+(function() {
+  var datesInput = document.getElementById('id_dates');
+  var pickerDate = document.getElementById('picker-date');
+  var addBtn = document.getElementById('add-date-btn');
+  var chipsContainer = document.getElementById('dates-chips');
+  var useRange = document.getElementById('id_use_date_range');
+  var rangeFields = document.getElementById('range-fields');
+  var dateFrom = document.getElementById('id_date_from');
+  var dateTo = document.getElementById('id_date_to');
+  var fillRangeBtn = document.getElementById('fill-range-btn');
+
+  var selectedDates = [];
+
+  function formatChipLabel(iso) {
+    var d = new Date(iso + 'T12:00:00');
+    var months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    var day = ('0' + d.getDate()).slice(-2);
+    return day + ' ' + months[d.getMonth()];
+  }
+
+  function syncHiddenInput() {
+    datesInput.value = selectedDates.sort().join(',');
+    renderChips();
+  }
+
+  function renderChips() {
+    chipsContainer.innerHTML = '';
+    selectedDates.forEach(function(iso) {
+      var chip = document.createElement('span');
+      chip.className = 'date-chip';
+      chip.innerHTML = '[' + formatChipLabel(iso) + '] <span class="remove-chip" data-date="' + iso + '" aria-label="Remove">&#10006;</span>';
+      chip.querySelector('.remove-chip').addEventListener('click', function() {
+        selectedDates = selectedDates.filter(function(d) { return d !== iso; });
+        syncHiddenInput();
+      });
+      chipsContainer.appendChild(chip);
+    });
+  }
+
+  addBtn.addEventListener('click', function() {
+    var v = pickerDate.value;
+    if (!v) return;
+    if (selectedDates.indexOf(v) === -1) {
+      selectedDates.push(v);
+      syncHiddenInput();
+    }
+    pickerDate.value = '';
+  });
+
+  fillRangeBtn.addEventListener('click', function() {
+    var from = dateFrom.value;
+    var to = dateTo.value;
+    if (!from || !to) return;
+    var fromD = new Date(from + 'T12:00:00');
+    var toD = new Date(to + 'T12:00:00');
+    if (fromD > toD) return;
+    var current = new Date(fromD);
+    while (current <= toD) {
+      var iso = current.getFullYear() + '-' + ('0' + (current.getMonth() + 1)).slice(-2) + '-' + ('0' + current.getDate()).slice(-2);
+      if (selectedDates.indexOf(iso) === -1) selectedDates.push(iso);
+      current.setDate(current.getDate() + 1);
+    }
+    syncHiddenInput();
+  });
+
+  useRange.addEventListener('change', function() {
+    rangeFields.style.display = useRange.checked ? 'block' : 'none';
+  });
+  rangeFields.style.display = useRange.checked ? 'block' : 'none';
+
+  // Init from existing value (e.g. validation error)
+  if (datesInput.value) {
+    selectedDates = datesInput.value.split(',').map(function(s) { return s.trim(); }).filter(Boolean);
+    renderChips();
+  }
+})();
+</script>
+{% endblock %}

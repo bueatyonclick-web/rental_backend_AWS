@@ -1,0 +1,9 @@
+{% extends "admin/change_list.html" %}
+{% load i18n admin_urls %}
+
+{% block object-tools-items %}
+  <li>
+    <a href="{% url 'admin:backend_artistavailability_bulk_add' %}" class="addlink">Bulk add / update dates</a>
+  </li>
+  {{ block.super }}
+{% endblock %}
