@@ -36,6 +36,12 @@ from backend.views import (
     get_service_categories, get_service_subcategories, get_all_services, get_user_service_bookings,
     cancel_booking, reschedule_booking, get_service_availability,
     get_available_time_slots, rate_service_booking,
+    # Service Vendor
+    service_vendor_request_otp, service_vendor_verify_otp, service_vendor_signup,
+    service_vendor_logout, service_vendor_my_services, service_vendor_create_service,
+    service_vendor_update_service, service_vendor_delete_service,
+    service_vendor_dashboard, service_vendor_bookings,
+    service_vendor_confirm_booking, service_vendor_cancel_booking,
 
     # Password Reset
     forgot_password, verify_forgot_password_otp, resend_forgot_password_otp, reset_password,
@@ -46,9 +52,20 @@ from backend.views import (
     vendor_create_product_option, vendor_update_product_option,
     vendor_delete_product_option, vendor_upload_product_image, vendor_delete_product_image,
     vendor_get_categories, vendor_bulk_update_stock,
-    vendor_orders, vendor_order_detail, vendor_accept_order, vendor_reject_order, vendor_logout, set_default_address,
+    vendor_orders, vendor_order_detail, vendor_accept_order, vendor_reject_order, vendor_logout, vendor_save_device_token, set_default_address,
     get_serviceable_locations, update_cart_item_quantity, get_service_wishlist, add_service_to_wishlist,
-    remove_service_from_wishlist, check_service_in_wishlist, change_password, guest_login, get_home_page_item_products
+    remove_service_from_wishlist, check_service_in_wishlist, change_password, guest_login, get_home_page_item_products,
+    vendor_trial_bookings, vendor_trial_decide,
+
+    # Referral & Wallet
+    referral_info, referral_history, wallet_transactions, referral_share
+    ,
+    # Trial-at-home
+    get_trial_settings, create_trial_booking, list_my_trial_bookings, trial_booking_detail,
+    mark_trial_booking_paid,
+
+    # Analytics
+    analytics_screen_start, analytics_screen_end, analytics_location_ping
 
 )
 
@@ -65,6 +82,9 @@ urlpatterns = [
     path('userdata/', userdata, name='userdata'),
     path('save-device-token/', save_device_token, name='save_device_token'),
     path('device-token-status/', device_token_status, name='device_token_status'),
+    path('analytics/screen/start/', analytics_screen_start, name='analytics_screen_start'),
+    path('analytics/screen/end/', analytics_screen_end, name='analytics_screen_end'),
+    path('analytics/location/ping/', analytics_location_ping, name='analytics_location_ping'),
     path('guest-login/', guest_login, name='guest_login'),
 
     # =============================================================================
@@ -150,6 +170,23 @@ urlpatterns = [
     path('profile/upload-image/', upload_profile_image, name='upload_profile_image'),
     path('profile/edit/', edit_profile, name='edit_profile'),
 
+    # =============================================================================
+    # REFERRAL & WALLET
+    # =============================================================================
+    path('referral/info/', referral_info, name='referral_info'),
+    path('referral/history/', referral_history, name='referral_history'),
+    path('wallet/transactions/', wallet_transactions, name='wallet_transactions'),
+    path('referral/share/', referral_share, name='referral_share'),
+
+    # =============================================================================
+    # TRIAL AT HOME (Trial Booking + Upsell Discount)
+    # =============================================================================
+    path('trial/settings/', get_trial_settings, name='get_trial_settings'),
+    path('trial/bookings/create/', create_trial_booking, name='create_trial_booking'),
+    path('trial/bookings/', list_my_trial_bookings, name='list_my_trial_bookings'),
+    path('trial/bookings/<uuid:trial_id>/', trial_booking_detail, name='trial_booking_detail'),
+    path('trial/bookings/<uuid:trial_id>/mark-paid/', mark_trial_booking_paid, name='mark_trial_booking_paid'),
+
 
     # =============================================================================
     # ADDRESS MANAGEMENT
@@ -197,6 +234,7 @@ urlpatterns = [
     # =============================================================================
     path('vendor/login/', vendor_login, name='vendor_login'),
     path('vendor/logout/', vendor_logout, name='vendor_logout'),
+    path('vendor/save-device-token/', vendor_save_device_token, name='vendor_save_device_token'),
     path('vendor/dashboard/', vendor_dashboard, name='vendor_dashboard'),
     path('vendor/products/', vendor_get_products, name='vendor_get_products'),
     path('vendor/products/<uuid:product_id>/', vendor_get_product_detail, name='vendor_get_product_detail'),
@@ -211,12 +249,30 @@ urlpatterns = [
     path('vendor/images/upload/', vendor_upload_product_image, name='vendor_upload_product_image'),
     path('vendor/images/<int:image_id>/delete/', vendor_delete_product_image, name='vendor_delete_product_image'),
     path('vendor/categories/', vendor_get_categories, name='vendor_get_categories'),
+    path('vendor/trial/bookings/', vendor_trial_bookings, name='vendor_trial_bookings'),
+    path('vendor/trial/bookings/<uuid:trial_id>/decide/', vendor_trial_decide, name='vendor_trial_decide'),
     path('vendor/stock/bulk-update/', vendor_bulk_update_stock, name='vendor_bulk_update_stock'),
     path('vendor/orders/', vendor_orders, name='vendor_orders'),
     path('vendor/orders/<uuid:order_id>/', vendor_order_detail, name='vendor_order_detail'),
     path('vendor/orders/<uuid:order_id>/accept/', vendor_accept_order, name='vendor_accept_order'),
     path('vendor/orders/<uuid:order_id>/reject/', vendor_reject_order, name='vendor_reject_order'),
     path('serviceable-locations/', get_serviceable_locations, name='get_serviceable_locations'),
+
+    # =============================================================================
+    # SERVICE VENDOR ENDPOINTS (Services mode)
+    # =============================================================================
+    path('service-vendor/request-otp/', service_vendor_request_otp, name='service_vendor_request_otp'),
+    path('service-vendor/verify-otp/', service_vendor_verify_otp, name='service_vendor_verify_otp'),
+    path('service-vendor/signup/', service_vendor_signup, name='service_vendor_signup'),
+    path('service-vendor/logout/', service_vendor_logout, name='service_vendor_logout'),
+    path('service-vendor/dashboard/', service_vendor_dashboard, name='service_vendor_dashboard'),
+    path('service-vendor/services/', service_vendor_my_services, name='service_vendor_my_services'),
+    path('service-vendor/services/create/', service_vendor_create_service, name='service_vendor_create_service'),
+    path('service-vendor/services/<uuid:service_id>/update/', service_vendor_update_service, name='service_vendor_update_service'),
+    path('service-vendor/services/<uuid:service_id>/delete/', service_vendor_delete_service, name='service_vendor_delete_service'),
+    path('service-vendor/bookings/', service_vendor_bookings, name='service_vendor_bookings'),
+    path('service-vendor/bookings/<uuid:booking_id>/confirm/', service_vendor_confirm_booking, name='service_vendor_confirm_booking'),
+    path('service-vendor/bookings/<uuid:booking_id>/cancel/', service_vendor_cancel_booking, name='service_vendor_cancel_booking'),
 
 
     # In the CART MANAGEMENT section, add:

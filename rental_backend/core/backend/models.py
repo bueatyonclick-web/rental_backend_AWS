@@ -8,6 +8,7 @@ from django.db import models
 import uuid
 from django.db import models
 from django.core.validators import MinValueValidator, MaxValueValidator
+from django.utils import timezone
 
 
 # ============== VENDOR MODEL ==============
@@ -26,9 +27,25 @@ class Vendor(models.Model):
     # Business Information
     business_address = models.TextField(blank=True, null=True)
     gst_number = models.CharField(max_length=15, blank=True, null=True)
+    pincode = models.CharField(
+        max_length=10,
+        blank=True,
+        default='',
+        help_text="Vendor pincode (used to filter categories by location)",
+    )
+    serviceable_locations = models.ManyToManyField(
+        'ServiceableLocation',
+        blank=True,
+        related_name='vendors',
+        help_text='Select multiple pincodes/areas where this vendor operates. Used for category filtering.',
+    )
 
     # Status
     is_active = models.BooleanField(default=True, help_text="Vendor account status")
+    trial_enabled = models.BooleanField(
+        default=True,
+        help_text="If enabled, customers can book Trial-at-Home for this vendor's products",
+    )
 
     # Timestamps
     created_at = models.DateTimeField(auto_now_add=True)
@@ -56,6 +73,72 @@ class Vendor(models.Model):
             else:
                 self.vendor_id = 'VEN001'
         super().save(*args, **kwargs)
+
+
+# ============== SERVICE VENDOR MODEL ==============
+class ServiceVendor(models.Model):
+    """
+    Service Vendor model - Self-registers via OTP (phone).
+    Used by vendor app in Services mode.
+    """
+    id = models.AutoField(primary_key=True)
+    service_vendor_id = models.CharField(
+        max_length=50,
+        unique=True,
+        help_text="Unique service vendor ID (e.g., SVCVEN001)",
+        blank=True,
+    )
+    name = models.CharField(max_length=200, help_text="Service vendor name / business name")
+    phone = models.CharField(max_length=15, unique=True, help_text="Phone used for OTP login")
+    area = models.CharField(max_length=200, blank=True, default='')
+    pincode = models.CharField(max_length=10, blank=True, default='')
+
+    # Admin-created services list (subcategories) the vendor can provide
+    service_subcategories = models.ManyToManyField(
+        'ServiceSubCategory',
+        blank=True,
+        related_name='service_vendors',
+    )
+
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Service Vendor"
+        verbose_name_plural = "Service Vendors"
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.service_vendor_id or self.id} - {self.name}"
+
+    def save(self, *args, **kwargs):
+        if not self.service_vendor_id:
+            last_vendor = ServiceVendor.objects.all().order_by('-id').first()
+            if last_vendor and last_vendor.service_vendor_id.startswith('SVCVEN'):
+                try:
+                    last_id = int(last_vendor.service_vendor_id.replace('SVCVEN', ''))
+                except Exception:
+                    last_id = last_vendor.id
+                self.service_vendor_id = f"SVCVEN{str(last_id + 1).zfill(3)}"
+            else:
+                self.service_vendor_id = "SVCVEN001"
+        super().save(*args, **kwargs)
+
+
+# ============== SERVICE VENDOR TOKEN MODEL ==============
+class ServiceVendorToken(models.Model):
+    token = models.CharField(max_length=500, unique=True)
+    vendor = models.ForeignKey(ServiceVendor, on_delete=models.CASCADE, related_name="tokens_set")
+    fcmtoken = models.CharField(max_length=500, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Service Vendor Token"
+        verbose_name_plural = "Service Vendor Tokens"
+
+    def __str__(self):
+        return f"{self.vendor.service_vendor_id} - Token"
 
 
 # ============== VENDOR TOKEN MODEL ==============
@@ -320,7 +403,7 @@ class Product(models.Model):
         help_text="Whether this product requires date selection for booking"
     )
     max_bookings_per_date = models.IntegerField(
-        default=10,
+        default=1,
         help_text="Maximum number of bookings allowed per date (0 = unlimited)"
     )
 
@@ -344,6 +427,13 @@ class Product(models.Model):
     star_1 = models.IntegerField(default=0)
     cod = models.BooleanField(default=True)
     position = models.IntegerField(default=9999, help_text="Display order within category (lower = first)")
+
+    # Security deposit (refundable after product return)
+    security_amount = models.IntegerField(
+        default=0,
+        help_text="Security amount in ₹ to be collected; refunded after product is received back"
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -872,6 +962,24 @@ class User(models.Model):
     phone = models.CharField(max_length=10)
     fullname = models.CharField(max_length=100)
     password = models.CharField(max_length=5000)
+
+    # Referral system fields
+    referral_code = models.CharField(max_length=20, unique=True, blank=True, null=True)
+    referred_by = models.ForeignKey(
+        'self',
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='referrals_made'
+    )
+    referral_wallet_balance = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    device_id = models.CharField(max_length=255, blank=True, null=True)
+    signup_ip = models.GenericIPAddressField(blank=True, null=True)
+
+    # Basic fraud / moderation
+    is_banned = models.BooleanField(default=False)
+    ban_reason = models.CharField(max_length=255, blank=True)
+
     wishlist = models.ManyToManyField(ProductOption, blank=True, related_name="wishlist")
     cart = models.ManyToManyField(ProductOption, blank=True, related_name="cart")
     service_wishlist = models.ManyToManyField(
@@ -1020,12 +1128,173 @@ class Order(models.Model):
         related_name='assigned_orders'
     )
 
+    # Coupon (optional)
+    coupon = models.ForeignKey(
+        'Coupon',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='orders'
+    )
+    discount_amount = models.IntegerField(
+        default=0,
+        help_text='Discount applied from coupon (in rupees)'
+    )
+    # Trial-at-home booking (optional). If set, order may receive trial-fee upsell discount.
+    trial_booking = models.ForeignKey(
+        'TrialBooking',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='orders',
+        help_text='Linked trial booking if this order was converted from a trial',
+    )
+    security_amount = models.IntegerField(
+        default=0,
+        help_text='Total security deposit in ₹ (refundable after product return)'
+    )
+
+    # Terms & Conditions acceptance (required to place order)
+    accepted_terms = models.BooleanField(
+        default=False,
+        help_text='User accepted rental Terms & Conditions at checkout'
+    )
+    accepted_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text='When the user accepted the Terms & Conditions'
+    )
+
     class Meta:
         indexes = [
             models.Index(fields=['vendor_status', 'created_at']),
             models.Index(fields=['assigned_vendor', 'vendor_status']),
         ]
 
+
+class TrialSettings(models.Model):
+    """
+    Admin-controlled configuration for Trial-at-Home feature.
+    Keep as a simple table; latest row is treated as active.
+    """
+    trial_enabled_areas = models.JSONField(default=list, blank=True, help_text='List of serviceable areas where trial is enabled')
+    trial_fee = models.PositiveIntegerField(default=0, help_text='Trial fee in ₹')
+    max_trial_items = models.PositiveIntegerField(default=3, help_text='Maximum items allowed in a single trial booking')
+    trial_discount_enabled = models.BooleanField(default=True, help_text='If true, trial fee can be applied as discount on conversion order')
+    trial_slots = models.JSONField(default=list, blank=True, help_text='List of time slots (e.g. ["morning","evening"])')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Trial Settings'
+        verbose_name_plural = 'Trial Settings'
+        ordering = ['-id']
+
+    def __str__(self):
+        return f"Trial settings (fee ₹{int(self.trial_fee or 0)}, max items {int(self.max_trial_items or 0)})"
+
+    @classmethod
+    def get_active(cls):
+        return cls.objects.order_by('-id').first()
+
+
+class TrialBooking(models.Model):
+    PAYMENT_UNPAID = 'unpaid'
+    PAYMENT_PAID = 'paid'
+    PAYMENT_CHOICES = [
+        (PAYMENT_UNPAID, 'Unpaid'),
+        (PAYMENT_PAID, 'Paid'),
+    ]
+
+    STATUS_PENDING = 'pending'
+    STATUS_APPROVED = 'approved'
+    STATUS_DELIVERED = 'delivered'
+    STATUS_COMPLETED = 'completed'
+    STATUS_CANCELLED = 'cancelled'
+    STATUS_CHOICES = [
+        (STATUS_PENDING, 'Pending'),
+        (STATUS_APPROVED, 'Approved'),
+        (STATUS_DELIVERED, 'Delivered'),
+        (STATUS_COMPLETED, 'Completed'),
+        (STATUS_CANCELLED, 'Cancelled'),
+    ]
+
+    # Vendor decision for the trial request (separate from fulfillment status)
+    DECISION_PENDING = 'pending'
+    DECISION_ACCEPTED = 'accepted'
+    DECISION_REJECTED = 'rejected'
+    DECISION_CHOICES = [
+        (DECISION_PENDING, 'Pending'),
+        (DECISION_ACCEPTED, 'Accepted'),
+        (DECISION_REJECTED, 'Rejected'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='trial_bookings')
+    vendor = models.ForeignKey(
+        Vendor,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='trial_bookings',
+        help_text='Vendor responsible for this trial booking (single-vendor enforced at creation)',
+    )
+    address = models.TextField(max_length=5000)
+    area = models.CharField(max_length=200)
+    trial_fee = models.PositiveIntegerField(default=0)
+    payment_status = models.CharField(max_length=20, choices=PAYMENT_CHOICES, default=PAYMENT_UNPAID)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING)
+    vendor_decision = models.CharField(
+        max_length=20,
+        choices=DECISION_CHOICES,
+        default=DECISION_PENDING,
+        help_text='Vendor accepted/rejected the trial request',
+    )
+    vendor_message = models.TextField(blank=True, default='', help_text='Optional vendor note/message')
+    vendor_decided_at = models.DateTimeField(null=True, blank=True)
+    trial_date = models.DateField()
+    time_slot = models.CharField(max_length=50)
+
+    # Conversion tracking (prevents reuse)
+    converted_order = models.OneToOneField(
+        'Order',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='converted_from_trial',
+    )
+    converted_at = models.DateTimeField(null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Trial Booking'
+        verbose_name_plural = 'Trial Bookings'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['user', 'created_at']),
+            models.Index(fields=['status', 'created_at']),
+            models.Index(fields=['payment_status', 'created_at']),
+            models.Index(fields=['vendor', 'vendor_decision', 'created_at']),
+        ]
+
+    def __str__(self):
+        return f"Trial {str(self.id)[:8]} - {self.user.email} - {self.status}"
+
+
+class TrialItem(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    trial = models.ForeignKey(TrialBooking, on_delete=models.CASCADE, related_name='items')
+    dress = models.ForeignKey(ProductOption, on_delete=models.CASCADE, related_name='trial_items')
+
+    class Meta:
+        verbose_name = 'Trial Item'
+        verbose_name_plural = 'Trial Items'
+        unique_together = [['trial', 'dress']]
+
+    def __str__(self):
+        return f"{self.trial_id} - {self.dress_id}"
 
 class OrderedProduct(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -1061,6 +1330,151 @@ class OrderedProduct(models.Model):
     def __str__(self):
         rental_info = f" [{self.rental_type.upper()}]" if self.rental_type else ""
         return f"{self.product_option}{rental_info}"
+
+    def save(self, *args, **kwargs):
+        """
+        When an OrderedProduct transitions to DELIVERED, we may trigger referral completion
+        for the referred user (first successful order) based on ReferralSettings.
+        """
+        old_status = None
+        if self.pk:
+            try:
+                old_status = OrderedProduct.objects.only('status').get(pk=self.pk).status
+            except OrderedProduct.DoesNotExist:
+                old_status = None
+
+        super().save(*args, **kwargs)
+
+        # Trigger only on first transition to DELIVERED
+        if old_status != 'DELIVERED' and self.status == 'DELIVERED':
+            order = self.order
+            user = order.user
+            _maybe_complete_referral_for_user(user=user, qualifying_amount=order.tx_amount, source_order=order)
+
+
+# ============== COUPON MODELS ==============
+class Coupon(models.Model):
+    """
+    Coupon codes for discounts. Can be restricted to products, categories, services,
+    first order only, minimum order value, and usage limits.
+    """
+    DISCOUNT_PERCENTAGE = 'percentage'
+    DISCOUNT_FLAT = 'flat'
+    DISCOUNT_TYPE_CHOICES = [
+        (DISCOUNT_PERCENTAGE, 'Percentage'),
+        (DISCOUNT_FLAT, 'Flat amount'),
+    ]
+
+    code = models.CharField(max_length=50, unique=True, db_index=True)
+    description = models.TextField(blank=True)
+
+    discount_type = models.CharField(
+        max_length=20,
+        choices=DISCOUNT_TYPE_CHOICES,
+        default=DISCOUNT_PERCENTAGE
+    )
+    discount_value = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        validators=[MinValueValidator(0)]
+    )
+    minimum_order_amount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+        validators=[MinValueValidator(0)],
+        help_text='Minimum cart total (in rupees) to use this coupon'
+    )
+    maximum_discount_amount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(0)],
+        help_text='Cap on discount (for percentage coupons); leave blank for no cap'
+    )
+
+    is_active = models.BooleanField(default=True)
+    valid_from = models.DateTimeField(help_text='Coupon valid from')
+    valid_until = models.DateTimeField(help_text='Coupon valid until')
+
+    usage_limit = models.IntegerField(
+        default=0,
+        help_text='Total number of times this coupon can be used (0 = unlimited)'
+    )
+    used_count = models.IntegerField(default=0)
+
+    first_order_only = models.BooleanField(
+        default=False,
+        help_text='If True, only users with no previous orders can use this coupon'
+    )
+
+    # Optional: restrict to specific products/categories/services. Empty = applicable to all.
+    applicable_products = models.ManyToManyField(
+        Product,
+        related_name='coupons',
+        blank=True,
+        help_text='Leave empty to apply to all products'
+    )
+    applicable_categories = models.ManyToManyField(
+        Category,
+        related_name='coupons',
+        blank=True,
+        help_text='Leave empty to apply to all categories'
+    )
+    applicable_services = models.ManyToManyField(
+        'Service',
+        related_name='coupons',
+        blank=True,
+        help_text='Leave empty to apply to all services'
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Coupon'
+        verbose_name_plural = 'Coupons'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.code} ({self.get_discount_type_display()})"
+
+
+class CouponUsage(models.Model):
+    """Tracks which user used which coupon on an order or a service booking (counts toward usage limit)."""
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='coupon_usages')
+    coupon = models.ForeignKey(Coupon, on_delete=models.CASCADE, related_name='usages')
+    order = models.ForeignKey(
+        Order,
+        on_delete=models.CASCADE,
+        related_name='coupon_usages',
+        null=True,
+        blank=True,
+        help_text='Set when coupon was used on a product order',
+    )
+    service_booking = models.ForeignKey(
+        'ServiceBooking',
+        on_delete=models.CASCADE,
+        related_name='coupon_usages',
+        null=True,
+        blank=True,
+        help_text='Set when coupon was used on a service booking',
+    )
+    used_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = 'Coupon Usage'
+        verbose_name_plural = 'Coupon Usages'
+        ordering = ['-used_at']
+
+    def __str__(self):
+        if self.order_id:
+            return f"{self.user.email} - {self.coupon.code} - Order {self.order_id}"
+        if self.service_booking_id:
+            return f"{self.user.email} - {self.coupon.code} - Booking {self.service_booking_id}"
+        return f"{self.user.email} - {self.coupon.code}"
+
 
 class VendorProduct(models.Model):
     """Link vendors to products they manage"""
@@ -1104,6 +1518,73 @@ class UserDevice(models.Model):
 
     def __str__(self):
         return f"{self.user.email} - {self.fcm_token[:20]}..."
+
+
+class ScreenViewEvent(models.Model):
+    """
+    Simple analytics event for screen opens + time spent.
+    Customer app calls:
+      - start: creates a row with started_at
+      - end: updates ended_at + duration_seconds
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='screen_view_events')
+    device_id = models.CharField(max_length=255, blank=True, default='', db_index=True)
+    session_id = models.CharField(max_length=64, blank=True, default='', db_index=True)
+    screen = models.CharField(max_length=150, db_index=True)
+
+    started_at = models.DateTimeField(auto_now_add=True)
+    ended_at = models.DateTimeField(null=True, blank=True)
+    duration_seconds = models.PositiveIntegerField(default=0, help_text='Computed on end (seconds)')
+
+    platform = models.CharField(max_length=20, blank=True, default='')
+    app_version = models.CharField(max_length=40, blank=True, default='')
+
+    class Meta:
+        verbose_name = 'Screen analytics event'
+        verbose_name_plural = 'Screen analytics events'
+        ordering = ['-started_at']
+        indexes = [
+            models.Index(fields=['screen', 'started_at']),
+            models.Index(fields=['user', 'started_at']),
+            models.Index(fields=['device_id', 'started_at']),
+        ]
+
+    def __str__(self):
+        who = self.user.email if self.user_id else (self.device_id or 'guest')
+        return f"{self.screen} - {who} @ {self.started_at}"
+
+
+class CustomerLocationPing(models.Model):
+    """
+    Stores customer's last known location pings (logged-in or guest by device_id).
+    Customer app should send only when permission is granted.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='location_pings')
+    device_id = models.CharField(max_length=255, db_index=True)
+
+    latitude = models.DecimalField(max_digits=9, decimal_places=6)
+    longitude = models.DecimalField(max_digits=9, decimal_places=6)
+    accuracy_m = models.FloatField(default=0)
+
+    platform = models.CharField(max_length=20, blank=True, default='')
+    app_version = models.CharField(max_length=40, blank=True, default='')
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = 'Customer location ping'
+        verbose_name_plural = 'Customer location pings'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['device_id', 'created_at']),
+            models.Index(fields=['user', 'created_at']),
+        ]
+
+    def __str__(self):
+        who = self.user.email if self.user_id else self.device_id
+        return f"{who} @ {self.created_at}"
 
 
 class AdminNotificationLog(models.Model):
@@ -1313,6 +1794,14 @@ class Service(models.Model):
     provider_name = models.CharField(max_length=200, default='')
     provider_phone = models.CharField(max_length=15, default='')
     provider_email = models.EmailField(blank=True)
+    service_vendor = models.ForeignKey(
+        'ServiceVendor',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='services_set',
+        help_text="If set, this service is owned/managed by a service vendor",
+    )
 
     # âœ… NEW: Languages spoken
     languages = models.CharField(
@@ -1438,6 +1927,77 @@ class ServiceBooking(models.Model):
     def __str__(self):
         return f"{self.customer_name} - {self.service_option.service.title} on {self.booking_date}"
 
+    def save(self, *args, **kwargs):
+        """
+        When a ServiceBooking transitions to COMPLETED with PAID payment_status, we may
+        trigger referral completion for the referred user based on ReferralSettings.
+        """
+        old_status = None
+        old_payment_status = None
+        if self.pk:
+            try:
+                old = ServiceBooking.objects.only('status', 'payment_status').get(pk=self.pk)
+                old_status = old.status
+                old_payment_status = old.payment_status
+            except ServiceBooking.DoesNotExist:
+                old_status = None
+                old_payment_status = None
+
+        super().save(*args, **kwargs)
+
+        # Trigger when we newly reach COMPLETED + PAID
+        if (old_status != 'COMPLETED' or old_payment_status != 'PAID') and \
+                self.status == 'COMPLETED' and self.payment_status == 'PAID':
+            _maybe_complete_referral_for_user(
+                user=self.user,
+                qualifying_amount=self.total_amount,
+                source_order=None,
+                source_booking=self,
+            )
+
+
+class ReferralSettings(models.Model):
+    """Configurable settings for the referral & wallet system."""
+    referral_reward_amount = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=100,
+        help_text="Amount credited to referrer's wallet per successful referral (in ₹)",
+    )
+    minimum_order_amount = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=300,
+        help_text="Minimum first order amount for referred user to qualify (in ₹)",
+    )
+    max_wallet_usage_percent = models.PositiveIntegerField(
+        default=20,
+        validators=[MinValueValidator(0), MaxValueValidator(100)],
+        help_text="Maximum % of order total that can be paid using referral wallet",
+    )
+    reward_hold_days = models.PositiveIntegerField(
+        default=7,
+        help_text="Number of days to hold referral reward before it can be approved/credited",
+    )
+    max_referrals_per_day = models.PositiveIntegerField(
+        default=5,
+        help_text="Maximum number of referrals that can earn rewards per referrer per day",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Referral Settings"
+        verbose_name_plural = "Referral Settings"
+
+    def __str__(self):
+        return f"Referral settings (reward ₹{self.referral_reward_amount}, wallet {self.max_wallet_usage_percent}%)"
+
+    @classmethod
+    def get_active(cls):
+        """Return the most recent settings instance or None."""
+        return cls.objects.order_by('-id').first()
+
 
 class ArtistAvailability(models.Model):
     """
@@ -1515,6 +2075,55 @@ class ServiceableLocation(models.Model):
         return f"{self.pincode} - {self.area_name}"
 
 
+class Referral(models.Model):
+    """
+    Tracks referral relationships and reward lifecycle.
+    Referrer gets reward in wallet after referred user completes first qualifying order.
+    """
+    STATUS_PENDING = 'pending'
+    STATUS_COMPLETED = 'completed'  # First qualifying order done, waiting for approval/hold
+    STATUS_REWARDED = 'rewarded'    # Wallet credited
+    STATUS_REJECTED = 'rejected'
+
+    STATUS_CHOICES = [
+        (STATUS_PENDING, 'Pending'),
+        (STATUS_COMPLETED, 'Completed'),
+        (STATUS_REWARDED, 'Rewarded'),
+        (STATUS_REJECTED, 'Rejected'),
+    ]
+
+    referrer = models.ForeignKey(
+        User,
+        related_name="referral_referrer_set",
+        on_delete=models.CASCADE,
+    )
+    referred_user = models.ForeignKey(
+        User,
+        related_name="referral_referred_set",
+        on_delete=models.CASCADE,
+    )
+    referral_code = models.CharField(max_length=20, help_text="Code used during signup")
+    reward_amount = models.DecimalField(max_digits=10, decimal_places=2)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING)
+    is_suspicious = models.BooleanField(default=False)
+    fraud_reason = models.CharField(max_length=255, blank=True)
+    device_id = models.CharField(max_length=255, blank=True)
+    signup_ip = models.GenericIPAddressField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    completed_at = models.DateTimeField(blank=True, null=True)
+    hold_until = models.DateTimeField(blank=True, null=True, help_text="Reward can be approved after this datetime")
+    rewarded_at = models.DateTimeField(blank=True, null=True)
+
+    class Meta:
+        verbose_name = "Referral"
+        verbose_name_plural = "Referrals"
+        unique_together = ['referrer', 'referred_user']
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.referrer.email} → {self.referred_user.email} ({self.status})"
+
+
 class CategoryAvailability(models.Model):
     """
     Control which categories are available in which pincodes
@@ -1578,6 +2187,135 @@ class ServiceCategoryAvailability(models.Model):
 
     def __str__(self):
         return f"{self.service_category.name} in {self.location.pincode}"
+
+
+class WalletTransaction(models.Model):
+    """Immutable ledger of all wallet credits/debits for referral wallet."""
+    TYPE_CREDIT = 'credit'
+    TYPE_DEBIT = 'debit'
+    TYPE_CHOICES = [
+        (TYPE_CREDIT, 'Credit'),
+        (TYPE_DEBIT, 'Debit'),
+    ]
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='wallet_transactions')
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    type = models.CharField(max_length=10, choices=TYPE_CHOICES)
+    description = models.CharField(max_length=255)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    # Optional linkage for better auditability
+    order = models.ForeignKey(
+        Order,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='wallet_transactions',
+    )
+    service_booking = models.ForeignKey(
+        ServiceBooking,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='wallet_transactions',
+    )
+
+    class Meta:
+        verbose_name = "Wallet Transaction"
+        verbose_name_plural = "Wallet Transactions"
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.user.email} - {self.type} ₹{self.amount}"
+
+
+def _maybe_complete_referral_for_user(user, qualifying_amount, source_order=None, source_booking=None):
+    """
+    When referred user completes first qualifying order (delivered / booking completed):
+    automatically credit reward to referrer's wallet, mark referral as REWARDED,
+    and send push notification. No admin approval required.
+    """
+    # Basic safety: don't process banned users
+    if getattr(user, 'is_banned', False):
+        return
+
+    # Load settings
+    settings_obj = ReferralSettings.get_active()
+    if not settings_obj:
+        return
+
+    try:
+        amount_int = int(qualifying_amount or 0)
+    except (TypeError, ValueError):
+        amount_int = 0
+
+    if amount_int < int(settings_obj.minimum_order_amount or 0):
+        return
+
+    # Find pending, non-suspicious referral for this user
+    referral = Referral.objects.filter(
+        referred_user=user,
+        status=Referral.STATUS_PENDING,
+        is_suspicious=False,
+    ).select_related('referrer', 'referred_user').first()
+
+    if not referral:
+        return
+
+    referrer = referral.referrer
+    if not referrer or getattr(referrer, 'is_banned', False):
+        return
+
+    reward_amount = referral.reward_amount or 0
+    if not reward_amount or reward_amount <= 0:
+        return
+
+    now = timezone.now()
+    from datetime import timedelta
+
+    # Mark completed and set hold_until (for audit; we credit immediately)
+    referral.status = Referral.STATUS_COMPLETED
+    referral.completed_at = now
+    referral.hold_until = now + timedelta(days=settings_obj.reward_hold_days or 0)
+    referral.save(update_fields=['status', 'completed_at', 'hold_until'])
+
+    # Auto-credit: add to referrer's wallet and mark as REWARDED (no admin approval)
+    wallet_balance = int(referrer.referral_wallet_balance or 0)
+    referrer.referral_wallet_balance = wallet_balance + int(reward_amount)
+    referrer.save(update_fields=['referral_wallet_balance'])
+
+    WalletTransaction.objects.create(
+        user=referrer,
+        amount=reward_amount,
+        type=WalletTransaction.TYPE_CREDIT,
+        description=f"Referral reward for {referral.referred_user.email}",
+    )
+
+    referral.status = Referral.STATUS_REWARDED
+    referral.rewarded_at = now
+    referral.save(update_fields=['status', 'rewarded_at'])
+
+    # Push: Wallet credited
+    referred_name = (
+        referral.referred_user.fullname
+        or referral.referred_user.email
+        or referral.referred_user.phone
+        or 'Your friend'
+    )
+    referred_name = str(referred_name)[:50]
+    reward_str = str(int(reward_amount))
+
+    try:
+        from backend.fcm_utils import send_fcm_to_user
+        send_fcm_to_user(
+            referrer,
+            'Wallet credited 💰',
+            f'{referred_name} completed their first order! Your ₹{reward_str} has been credited to your referral wallet.',
+            data={'screen': 'referral', 'type': 'referral_wallet_credited'},
+        )
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning('Referral push (wallet credited) failed: %s', e)
 
 
 # models.py - Add this new model

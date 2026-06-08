@@ -1,0 +1,31 @@
+{% extends "admin/base_site.html" %}
+
+{% block content %}
+  <h1>App opens (daily)</h1>
+
+  <p>Counts are based on analytics events with screen = <code>app_open</code>.</p>
+
+  <div class="module">
+    <table class="adminlist">
+      <thead>
+        <tr>
+          <th>Date</th>
+          <th>Opens</th>
+          <th>Unique users</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in rows %}
+          <tr>
+            <td>{{ r.day }}</td>
+            <td>{{ r.opens }}</td>
+            <td>{{ r.unique_users }}</td>
+          </tr>
+        {% empty %}
+          <tr><td colspan="3">No app open data yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% endblock %}
+

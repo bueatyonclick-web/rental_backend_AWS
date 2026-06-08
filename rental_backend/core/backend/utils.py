@@ -13,13 +13,14 @@ from google.auth.transport.requests import Request
 from rest_framework.permissions import BasePermission
 from rest_framework.response import Response
 
-from backend.models import Otp, Token, PasswordResetToken, Notification, VendorToken
+from backend.models import Otp, Token, PasswordResetToken, Notification, VendorToken, ServiceVendorToken
 from backend.serializers import NotificationSerializer
 from core.settings import (
     HYPERsender_API_KEY,
     HYPERsender_INSTANCE_ID,
     HYPERsender_WHATSAPP_BASE_URL,
 )
+from django.db.models import Q
 from django.utils import timezone
 
 from twilio.rest import Client
@@ -196,6 +197,14 @@ class IsAuthenticatedVendor(BasePermission):
         return isinstance(request.user, Vendor) and request.user.is_active
 
 
+class IsAuthenticatedServiceVendor(BasePermission):
+    message = 'unauthenticated_service_vendor'
+
+    def has_permission(self, request, view):
+        from backend.models import ServiceVendor
+        return isinstance(request.user, ServiceVendor) and request.user.is_active
+
+
 def get_pincode_from_coordinates(latitude, longitude):
     """
     Get pincode from latitude/longitude using geocoding
@@ -239,79 +248,239 @@ def check_pincode_serviceability(pincode):
         return False, None, "We're coming soon to your location! ðŸš€"
 
 
+def validate_coupon_and_calculate_discount(
+    coupon_code,
+    user,
+    cart_total,
+    product_option_ids=None,
+    product_ids=None,
+    service_ids=None,
+):
+    """
+    Validate a coupon for the given user and cart, and calculate discount.
+    Returns: (success: bool, message: str, discount_amount: int, final_total: int, coupon_obj or None)
+
+    - product_option_ids: list of ProductOption UUIDs in cart (for product eligibility)
+    - product_ids: list of Product UUIDs in cart (alternative; we derive from product_option if needed)
+    - service_ids: list of Service UUIDs in cart (for service eligibility)
+    """
+    from decimal import Decimal
+    from backend.models import Coupon, Order, ProductOption
+
+    product_option_ids = product_option_ids or []
+    product_ids = list(product_ids) if product_ids else []
+    service_ids = service_ids or []
+
+    # Resolve product IDs from product_option_ids if needed
+    if product_option_ids and not product_ids:
+        product_ids = list(
+            ProductOption.objects.filter(id__in=product_option_ids)
+            .values_list('product_id', flat=True)
+            .distinct()
+        )
+
+    coupon_code = (coupon_code or '').strip().upper()
+    if not coupon_code:
+        return False, 'Coupon code is required', 0, int(cart_total), None
+
+    try:
+        coupon = Coupon.objects.prefetch_related(
+            'applicable_products', 'applicable_categories', 'applicable_services'
+        ).get(code=coupon_code)
+    except Coupon.DoesNotExist:
+        return False, 'Invalid or expired coupon code', 0, int(cart_total), None
+
+    if not coupon.is_active:
+        return False, 'Invalid or expired coupon code', 0, int(cart_total), None
+
+    now = timezone.now()
+    if now < coupon.valid_from:
+        return False, 'This coupon is not yet valid', 0, int(cart_total), None
+    if now > coupon.valid_until:
+        return False, 'Invalid or expired coupon code', 0, int(cart_total), None
+
+    if coupon.usage_limit > 0 and coupon.used_count >= coupon.usage_limit:
+        return False, 'This coupon has reached its usage limit', 0, int(cart_total), None
+
+    if coupon.first_order_only:
+        if Order.objects.filter(user=user).exists():
+            return False, 'This coupon is valid for first order only', 0, int(cart_total), None
+
+    cart_total_decimal = Decimal(str(cart_total))
+    if cart_total_decimal < coupon.minimum_order_amount:
+        return (
+            False,
+            f'Minimum order value of ₹{coupon.minimum_order_amount} required for this coupon',
+            0,
+            int(cart_total),
+            None,
+        )
+
+    # Service booking: only check applicable_services (ignore product/category for this request)
+    if service_ids:
+        if coupon.applicable_services.exists():
+            # Normalize to strings for comparison (DB returns UUIDs, request sends strings)
+            allowed_service_ids = {str(sid).strip().lower() for sid in coupon.applicable_services.values_list('id', flat=True)}
+            request_service_ids = {str(sid).strip().lower() for sid in service_ids}
+            if not (request_service_ids & allowed_service_ids):
+                return False, 'This coupon is not applicable to this service', 0, int(cart_total), None
+        # Service request passed (or coupon has no service restriction). Skip product/category checks.
+    else:
+        # Product/cart order: check applicable_products and applicable_categories
+        if coupon.applicable_products.exists():
+            if not product_ids:
+                return False, 'This coupon is not applicable to your cart items', 0, int(cart_total), None
+            allowed_product_ids = set(coupon.applicable_products.values_list('id', flat=True))
+            if not (set(product_ids) & allowed_product_ids):
+                return False, 'This coupon is not applicable to your cart items', 0, int(cart_total), None
+
+        if coupon.applicable_categories.exists():
+            if not product_ids:
+                return False, 'This coupon is not applicable to your cart items', 0, int(cart_total), None
+            from backend.models import Product
+            cart_category_ids = set(
+                Product.objects.filter(id__in=product_ids).values_list('category_id', flat=True)
+            )
+            allowed_cat_ids = set(coupon.applicable_categories.values_list('id', flat=True))
+            if not (cart_category_ids & allowed_cat_ids):
+                return False, 'This coupon is not applicable to your cart items', 0, int(cart_total), None
+
+    # Calculate discount
+    if coupon.discount_type == Coupon.DISCOUNT_PERCENTAGE:
+        discount = (cart_total_decimal * coupon.discount_value) / Decimal('100')
+    else:
+        discount = coupon.discount_value
+
+    if coupon.maximum_discount_amount is not None and coupon.maximum_discount_amount > 0:
+        discount = min(discount, coupon.maximum_discount_amount)
+
+    discount = int(discount)
+    discount = min(discount, int(cart_total))
+    final_total = max(0, int(cart_total) - discount)
+
+    return True, 'Coupon applied successfully', discount, final_total, coupon
+
+
 def get_available_categories_for_pincode(pincode):
     """
-    Get categories available for a specific pincode
+    If this serviceable location has any CategoryAvailability rows, only categories
+    explicitly enabled there are shown (whitelist for that pincode).
+
+    If the location has no rows yet (not configured in admin), use legacy rules:
+    categories with no availability rows anywhere are global; categories with rows
+    only appear in pincodes where they are enabled.
     """
     from backend.models import ServiceableLocation, CategoryAvailability, Category
 
     try:
         location = ServiceableLocation.objects.get(pincode=pincode, is_active=True)
-
-        # Get categories with explicit availability
-        available_cat_ids = CategoryAvailability.objects.filter(
-            location=location,
-            is_available=True
-        ).values_list('category_id', flat=True)
-
-        if available_cat_ids:
-            return Category.objects.filter(id__in=available_cat_ids).order_by('position')
-        else:
-            # If no specific availability set, return all categories
-            return Category.objects.all().order_by('position')
-
     except ServiceableLocation.DoesNotExist:
         return Category.objects.none()
+
+    if CategoryAvailability.objects.filter(location=location).exists():
+        available_ids = CategoryAvailability.objects.filter(
+            location=location,
+            is_available=True,
+        ).values_list('category_id', flat=True)
+        return Category.objects.filter(id__in=available_ids).order_by('position')
+
+    restricted_ids = CategoryAvailability.objects.values_list(
+        'category_id', flat=True
+    ).distinct()
+    if not restricted_ids:
+        return Category.objects.all().order_by('position')
+
+    unrestricted_qs = Category.objects.exclude(id__in=restricted_ids)
+    restricted_here_qs = Category.objects.filter(
+        location_availability__location=location,
+        location_availability__is_available=True,
+    )
+    return (
+        Category.objects.filter(
+            Q(id__in=unrestricted_qs.values('id'))
+            | Q(id__in=restricted_here_qs.values('id'))
+        )
+        .distinct()
+        .order_by('position')
+    )
 
 
 def get_available_page_items_for_pincode(pincode):
     """
-    Get page items available for a specific pincode
+    Same whitelist vs legacy split as get_available_categories_for_pincode.
     """
     from backend.models import ServiceableLocation, PageItemAvailability, PageItem
 
     try:
         location = ServiceableLocation.objects.get(pincode=pincode, is_active=True)
-
-        # Get page items with explicit availability
-        available_item_ids = PageItemAvailability.objects.filter(
-            location=location,
-            is_available=True
-        ).values_list('page_item_id', flat=True)
-
-        if available_item_ids:
-            return PageItem.objects.filter(id__in=available_item_ids).order_by('position')
-        else:
-            # If no specific availability set, return all page items
-            return PageItem.objects.all().order_by('position')
-
     except ServiceableLocation.DoesNotExist:
         return PageItem.objects.none()
+
+    if PageItemAvailability.objects.filter(location=location).exists():
+        available_ids = PageItemAvailability.objects.filter(
+            location=location,
+            is_available=True,
+        ).values_list('page_item_id', flat=True)
+        return PageItem.objects.filter(id__in=available_ids).order_by('position')
+
+    restricted_ids = PageItemAvailability.objects.values_list(
+        'page_item_id', flat=True
+    ).distinct()
+    if not restricted_ids:
+        return PageItem.objects.all().order_by('position')
+
+    unrestricted_qs = PageItem.objects.exclude(id__in=restricted_ids)
+    restricted_here_qs = PageItem.objects.filter(
+        location_availability__location=location,
+        location_availability__is_available=True,
+    )
+    return (
+        PageItem.objects.filter(
+            Q(id__in=unrestricted_qs.values('id'))
+            | Q(id__in=restricted_here_qs.values('id'))
+        )
+        .distinct()
+        .order_by('position')
+    )
 
 
 def get_available_service_categories_for_pincode(pincode):
     """
-    Get service categories available for a specific pincode
+    Same whitelist vs legacy split as get_available_categories_for_pincode.
     """
     from backend.models import ServiceableLocation, ServiceCategoryAvailability, ServiceCategory
 
     try:
         location = ServiceableLocation.objects.get(pincode=pincode, is_active=True)
-
-        # Get service categories with explicit availability
-        available_cat_ids = ServiceCategoryAvailability.objects.filter(
-            location=location,
-            is_available=True
-        ).values_list('service_category_id', flat=True)
-
-        if available_cat_ids:
-            return ServiceCategory.objects.filter(id__in=available_cat_ids).order_by('position')
-        else:
-            # If no specific availability set, return all service categories
-            return ServiceCategory.objects.all().order_by('position')
-
     except ServiceableLocation.DoesNotExist:
         return ServiceCategory.objects.none()
+
+    if ServiceCategoryAvailability.objects.filter(location=location).exists():
+        available_ids = ServiceCategoryAvailability.objects.filter(
+            location=location,
+            is_available=True,
+        ).values_list('service_category_id', flat=True)
+        return ServiceCategory.objects.filter(id__in=available_ids).order_by('position')
+
+    restricted_ids = ServiceCategoryAvailability.objects.values_list(
+        'service_category_id', flat=True
+    ).distinct()
+    if not restricted_ids:
+        return ServiceCategory.objects.all().order_by('position')
+
+    unrestricted_qs = ServiceCategory.objects.exclude(id__in=restricted_ids)
+    restricted_here_qs = ServiceCategory.objects.filter(
+        location_availability__location=location,
+        location_availability__is_available=True,
+    )
+    return (
+        ServiceCategory.objects.filter(
+            Q(id__in=unrestricted_qs.values('id'))
+            | Q(id__in=restricted_here_qs.values('id'))
+        )
+        .distinct()
+        .order_by('position')
+    )
 
 
 def get_coordinates_from_location(pincode, area_name, city=None, state=None):

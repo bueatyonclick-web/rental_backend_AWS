@@ -39,7 +39,23 @@ def _send_to_tokens(tokens, title, body, data=None):
     data = data or {}
     # Ensure all data values are strings (FCM requirement)
     data = {k: str(v) for k, v in data.items()}
-    android_config = messaging.AndroidConfig(priority='high')
+    android_config = messaging.AndroidConfig(
+        priority='high',
+        notification=messaging.AndroidNotification(
+            # Must match channel created by vendor app.
+            channel_id='vendor_push_alerts',
+            sound='default',
+            click_action='FLUTTER_NOTIFICATION_CLICK',
+        ),
+    )
+    apns_config = messaging.APNSConfig(
+        payload=messaging.APNSPayload(
+            aps=messaging.Aps(
+                sound='default',
+                content_available=True,
+            )
+        )
+    )
     total_success, total_failure = 0, 0
     for i in range(0, len(tokens), FCM_MULTICAST_BATCH_SIZE):
         batch_tokens = tokens[i : i + FCM_MULTICAST_BATCH_SIZE]
@@ -47,6 +63,7 @@ def _send_to_tokens(tokens, title, body, data=None):
             notification=messaging.Notification(title=title, body=body),
             data=data,
             android=android_config,
+            apns=apns_config,
             tokens=batch_tokens,
         )
         batch = messaging.send_each_for_multicast(message)
@@ -88,5 +105,45 @@ def send_fcm_to_all_users(title, body, data=None):
     tokens = list(UserDevice.objects.values_list('fcm_token', flat=True).distinct())
     if not tokens:
         print('FCM: No device tokens in database')
+        return 0, 0
+    return _send_to_tokens(tokens, title, body, data)
+
+
+def _get_tokens_for_vendors(vendors):
+    """Return list of FCM tokens for the given vendor queryset or list of Vendor instances."""
+    from backend.models import VendorToken
+    if hasattr(vendors, 'values_list'):
+        vendor_ids = list(vendors.values_list('id', flat=True))
+    else:
+        vendor_ids = [v.id for v in vendors]
+    return list(
+        VendorToken.objects.filter(vendor_id__in=vendor_ids)
+        .exclude(fcmtoken__isnull=True)
+        .exclude(fcmtoken__exact='')
+        .values_list('fcmtoken', flat=True)
+        .distinct()
+    )
+
+
+def send_fcm_to_vendor(vendor, title, body, data=None):
+    """
+    Send push notification to a single vendor (all active sessions/devices).
+    Returns (success_count, failure_count).
+    """
+    tokens = _get_tokens_for_vendors([vendor])
+    if not tokens:
+        print(f'FCM: No vendor tokens for vendor {vendor.id} ({getattr(vendor, "email", "")})')
+        return 0, 0
+    return _send_to_tokens(tokens, title, body, data)
+
+
+def send_fcm_to_vendors(vendors, title, body, data=None):
+    """
+    Send push notification to multiple vendors.
+    vendors: queryset of Vendor or list of Vendor.
+    Returns (success_count, failure_count).
+    """
+    tokens = _get_tokens_for_vendors(vendors)
+    if not tokens:
         return 0, 0
     return _send_to_tokens(tokens, title, body, data)

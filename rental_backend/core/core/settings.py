@@ -21,12 +21,23 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # See https://docs.djangoproject.com/en/5.1/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-z)3ufq8vue4cy_%+4)$*at%6=3vxsx&ke=3@pt$jqbvgwqvbpr'
+SECRET_KEY = os.environ.get(
+    'DJANGO_SECRET_KEY',
+    'django-insecure-z)3ufq8vue4cy_%+4)$*at%6=3vxsx&ke=3@pt$jqbvgwqvbpr',
+)
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = os.environ.get('DJANGO_DEBUG', 'True').lower() in ('1', 'true', 'yes')
 
-ALLOWED_HOSTS = ['*']
+ALLOWED_HOSTS = [
+    '.vercel.app',
+    '127.0.0.1',
+    'localhost',
+    '10.0.2.2',
+]
+_extra_hosts = os.environ.get('DJANGO_ALLOWED_HOSTS', '')
+if _extra_hosts:
+    ALLOWED_HOSTS.extend(h.strip() for h in _extra_hosts.split(',') if h.strip())
 
 # Application definition
 
@@ -44,6 +55,7 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     "corsheaders.middleware.CorsMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -77,23 +89,34 @@ WSGI_APPLICATION = 'core.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/4.0/ref/settings/#databases
 
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
-    }
-}
+if os.environ.get('DATABASE_URL'):
+    import dj_database_url
 
-# DATABASES = {
-#     'default': {
-#         'ENGINE': 'django.db.backends.postgresql',
-#         'NAME': 'postgres',  # You can change this if you created a different DB
-#         'USER': 'super',
-#         'PASSWORD': 'clickWELL_postgresdb',
-#         'HOST': 'Clickwelladmin-4622.postgres.pythonanywhere-services.com',
-#         'PORT': '14622',
-#     }
-# }
+    DATABASES = {
+        'default': dj_database_url.config(
+            default=os.environ['DATABASE_URL'],
+            conn_max_age=600,
+            ssl_require=True,
+        )
+    }
+elif os.environ.get('DB_HOST'):
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.postgresql',
+            'NAME': os.environ.get('DB_NAME', 'postgres'),
+            'USER': os.environ.get('DB_USER', ''),
+            'PASSWORD': os.environ.get('DB_PASSWORD', ''),
+            'HOST': os.environ['DB_HOST'],
+            'PORT': os.environ.get('DB_PORT', '5432'),
+        }
+    }
+else:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
+        }
+    }
 
 
 # Password validation
@@ -136,6 +159,15 @@ TIME_ZONE =  'Asia/Kolkata'
 STATIC_URL = 'static/'
 
 STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
+
+STORAGES = {
+    'default': {
+        'BACKEND': 'django.core.files.storage.FileSystemStorage',
+    },
+    'staticfiles': {
+        'BACKEND': 'whitenoise.storage.CompressedManifestStaticFilesStorage',
+    },
+}
 
 JAZZMIN_SETTINGS = {
     "welcome_sign": "Welcome to the Rental Admin Panel",
@@ -197,6 +229,19 @@ HYPERsender_API_KEY = os.environ.get("HYPERsender_API_KEY", "1119|HK5rlDllCrK9x0
 HYPERsender_INSTANCE_ID = os.environ.get("HYPERsender_INSTANCE_ID", "a11fec5f-d083-43ee-af5e-b5dda6e3a6d5")
 HYPERsender_WHATSAPP_BASE_URL = "https://app.hypersender.com/api/whatsapp/v2"
 
+# -----------------------------------------------------------------------------
+# Referral share link – must point to a URL you control or to app stores
+# -----------------------------------------------------------------------------
+# When users share a referral link (e.g. via WhatsApp), this is the URL that opens.
+# - If you have a website with signup: use e.g. https://yourdomain.com/signup
+# - If you only have the app: use your Google Play app link so the friend can download.
+#   Example: https://play.google.com/store/apps/details?id=com.yourcompany.rentalcothes
+# - Do NOT use yourapp.com – it is a placeholder and shows "domain for sale".
+REFERRAL_SIGNUP_BASE_URL = os.environ.get(
+    "REFERRAL_SIGNUP_BASE_URL",
+    "https://play.google.com/store/apps/details?id=com.chaitanya.rentalcothes",  # Your Android app – replace with your website signup URL if you prefer
+)
+
 
 
 
@@ -237,10 +282,10 @@ from firebase_admin import credentials
 _FIREBASE_JSON = os.path.join(str(BASE_DIR), 'backend', 'beautyonclick-45c23-firebase-adminsdk-fbsvc-e78a918a62.json')
 if os.path.isfile(_FIREBASE_JSON):
     FIREBASE_ADMIN_CREDENTIALS = credentials.Certificate(_FIREBASE_JSON)
-    print(f'📲 FCM: Credentials loaded from {_FIREBASE_JSON}')
+    print(f'FCM: Credentials loaded from {_FIREBASE_JSON}')
 else:
     FIREBASE_ADMIN_CREDENTIALS = None
-    print(f'📲 FCM: No credentials file at {_FIREBASE_JSON} - push notifications disabled')
+    print(f'FCM: No credentials file at {_FIREBASE_JSON} - push notifications disabled')
 
 
 

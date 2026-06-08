@@ -1,7 +1,7 @@
 from rest_framework import exceptions
 from rest_framework.authentication import BaseAuthentication
 
-from backend.models import Token, VendorToken
+from backend.models import Token, VendorToken, ServiceVendorToken
 
 
 class TokenAuthentication(BaseAuthentication):
@@ -51,5 +51,30 @@ class VendorTokenAuthentication(BaseAuthentication):
 
         except VendorToken.DoesNotExist:
             raise exceptions.AuthenticationFailed('Invalid or expired vendor token')
+        except Exception as e:
+            raise exceptions.AuthenticationFailed(f'Authentication failed: {str(e)}')
+
+
+class ServiceVendorTokenAuthentication(BaseAuthentication):
+    def authenticate(self, request):
+        token = request.headers.get('Authorization')
+        if not token:
+            return None, None
+
+        try:
+            token_parts = str(token).split()
+            if len(token_parts) != 2 or token_parts[0].lower() not in ['token', 'Token']:
+                raise exceptions.AuthenticationFailed('Invalid token format')
+
+            token_value = token_parts[1]
+            sv_token = ServiceVendorToken.objects.select_related('vendor').get(token=token_value)
+
+            if not sv_token.vendor.is_active:
+                raise exceptions.AuthenticationFailed('Service vendor account is deactivated')
+
+            return sv_token.vendor, None
+
+        except ServiceVendorToken.DoesNotExist:
+            raise exceptions.AuthenticationFailed('Invalid or expired service vendor token')
         except Exception as e:
             raise exceptions.AuthenticationFailed(f'Authentication failed: {str(e)}')

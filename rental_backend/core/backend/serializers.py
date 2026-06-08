@@ -288,13 +288,25 @@ class PageItemSerializer(ModelSerializer):
         options = obj.product_options.all()[:8]
         data = []
         for option in options:
+            price_val = option.get_price() or 0
+            offer_val = option.get_offer_price() or 0
+            effective_price = offer_val if (offer_val > 0 and price_val and offer_val < price_val) else price_val
+            cutted_price = price_val if (offer_val > 0 and price_val and offer_val < price_val) else None
+            discount_percentage = round(((price_val - effective_price) / price_val) * 100) if cutted_price and price_val > 0 else 0
             data.append({
-                'id': option.product.id,
+                'id': str(option.product.id),
+                'option_id': str(option.id),
                 'image': ProductImageSerializer(option.images_set.order_by('position').first(), many=False).data.get(
                     'image'),
                 'title': option.__str__(),
-                'price': option.product.price,
-                'offer_price': option.product.offer_price,
+                'price': price_val,
+                'offer_price': offer_val,
+                'effective_price': effective_price,
+                'cutted_price': cutted_price,
+                'discount_percentage': discount_percentage,
+                'option_price': option.option_price if option.option_price > 0 else None,
+                'buy_price': option.get_buy_price(),
+                'rental_price_per_day': option.get_rental_price('1_day'),
             })
 
         return data
@@ -1086,7 +1098,7 @@ class HomePageItemSerializer(serializers.ModelSerializer):
             return self._serialize_service_items(items, request)
 
     def _serialize_product_items(self, items, request):
-        """Serialize product items with rental pricing"""
+        """Serialize product items with rental pricing. Use option rent price (200) for cards, not buy price (7500)."""
         data = []
         for option in items:
             first_image = option.images_set.first()
@@ -1094,31 +1106,39 @@ class HomePageItemSerializer(serializers.ModelSerializer):
             if first_image and first_image.image:
                 try:
                     image_url = request.build_absolute_uri(first_image.image.url) if request else first_image.image.url
-                except:
+                except Exception:
                     pass
 
-            # âœ… Get 1-day rental price
-            rental_price_1_day = option.get_rental_price('1_day')
+            # Use option-level rent price/offer for card (Option price: 200, Option offer price: 150), not buy price
+            price_val = option.get_price() or 0
+            offer_val = option.get_offer_price() or 0
+            effective_price = offer_val if (offer_val > 0 and price_val and offer_val < price_val) else price_val
+            cutted_price = price_val if (offer_val > 0 and price_val and offer_val < price_val) else None
+            discount_percentage = 0
+            if cutted_price and price_val > 0:
+                discount_percentage = round(((price_val - effective_price) / price_val) * 100)
 
-            # âœ… Get buy prices for comparison
+            rental_price_1_day = option.get_rental_price('1_day')
             buy_price = option.get_buy_price()
-            buy_offer_price = option.get_buy_offer_price()
 
             data.append({
                 'id': str(option.product.id),
                 'option_id': str(option.id),
+                'product_option_id': str(option.id),
                 'title': f"({option.option}) {option.product.title}" if option.option else option.product.title,
-                'price': option.product.price,
-                'offer_price': option.product.offer_price,
+                'price': price_val,
+                'offer_price': offer_val,
+                'effective_price': effective_price,
+                'cutted_price': cutted_price,
+                'discount_percentage': discount_percentage,
+                'option_price': option.option_price if option.option_price > 0 else None,
+                'buy_price': buy_price,
                 'image': image_url,
                 'quantity_available': option.quantity,
 
-                # âœ… NEW: Rental pricing fields
                 'rental_price_per_day': rental_price_1_day,
-                'buy_price': buy_price,
-                'buy_offer_price': buy_offer_price,
+                'buy_offer_price': option.get_buy_offer_price(),
 
-                # âœ… NEW: Full rental pricing for details
                 'rental_pricing': {
                     '1_day': option.get_rental_price('1_day'),
                     '2_days': option.get_rental_price('2_days'),

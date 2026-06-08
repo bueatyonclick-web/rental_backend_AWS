@@ -38,7 +38,8 @@ from django.utils.encoding import force_str
 from backend.models import User, Otp, Token, Category, Slide, HomeBanner, Product, PageItem, ProductOption, Order, \
     OrderedProduct, Service, ServiceBooking, ServicePageItem, ServiceCategory, ServiceSubCategory, ServiceOption, PasswordResetToken, \
     ProductImage, Vendor, VendorToken, ProductBooking, CartItem, Notification, VendorProduct, UserAddress, \
-    ServiceableLocation, HomePageItem, ServiceWishlistItem, UserDevice, ArtistAvailability
+    ServiceableLocation, HomePageItem, ServiceWishlistItem, UserDevice, ArtistAvailability, CategoryAvailability, \
+    ReferralSettings, Referral, WalletTransaction, ServiceVendor, ServiceVendorToken
 from backend.serializers import UserSerializer, CategorySerializer, SlideSerializer, PageItemSerializer, \
     ProductSerializer, WishlistSerializer, CartSerializer, AddressSerializer, ItemOrderSerializer, \
     OrderDetailsSerializer, NotificationSerializer, OrderItemSerializer, ProductOptionSerializer, InformMeSerializer, \
@@ -47,18 +48,191 @@ from backend.serializers import UserSerializer, CategorySerializer, SlideSeriali
     ServiceWishlistItemSerializer
 
 from backend.utils import send_otp, token_response, send_password_reset_email, IsAuthenticatedUser, \
-    new_token, IsAuthenticatedVendor
+    new_token, IsAuthenticatedVendor, IsAuthenticatedServiceVendor
 from core import settings
 from core.settings import TEMPLATES_BASE_URL
 from rest_framework import status as http_status
 
 from . import models
-from .authentication import VendorTokenAuthentication
+from .authentication import VendorTokenAuthentication, ServiceVendorTokenAuthentication
 from .serializers import PrivacyPolicySerializer
 
 from django.views.decorators.csrf import csrf_exempt
 
 logger = logging.getLogger(__name__)
+
+
+def _notify_user_trial_decision(user, title, body, data=None):
+    """
+    Send push + create in-app Notification row for trial decision.
+    Best-effort: never break vendor accept/reject if push fails.
+    """
+    try:
+        # In-app notifications list
+        Notification.objects.create(user=user, title=title, body=body)
+    except Exception:
+        pass
+
+    try:
+        from backend.fcm_utils import send_fcm_to_user
+        send_fcm_to_user(
+            user,
+            title,
+            body,
+            data=data or {'screen': 'trial', 'type': 'trial_vendor_decision'},
+        )
+    except Exception as e:
+        logger.warning('Trial decision push failed: %s', e)
+
+
+# =============================================================================
+# ANALYTICS: SCREEN VIEW EVENTS (Customer app)
+# =============================================================================
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def analytics_screen_start(request):
+    """
+    Create a ScreenViewEvent row. Call when a screen becomes visible.
+    Body:
+      - screen: string (required)
+      - device_id: string (optional)
+      - session_id: string (optional)
+      - platform: android/ios/web (optional)
+      - app_version: string (optional)
+    Auth:
+      - If user token present, links to user.
+      - If guest, user=null but device_id can be set for uniqueness.
+    Returns:
+      - event_id
+    """
+    from backend.models import ScreenViewEvent
+    screen = (request.data.get('screen') or '').strip()
+    if not screen:
+        return Response({'success': False, 'message': 'screen is required'}, status=400)
+
+    device_id = (request.data.get('device_id') or '').strip()
+    session_id = (request.data.get('session_id') or '').strip()
+    platform = (request.data.get('platform') or '').strip()
+    app_version = (request.data.get('app_version') or '').strip()
+
+    user = None
+    try:
+        # If request has authenticated user, attach it
+        if getattr(request, 'user', None) and getattr(request.user, 'is_authenticated', False):
+            user = request.user
+    except Exception:
+        user = None
+
+    ev = ScreenViewEvent.objects.create(
+        user=user if getattr(user, 'id', None) else None,
+        device_id=device_id,
+        session_id=session_id,
+        screen=screen[:150],
+        platform=platform[:20],
+        app_version=app_version[:40],
+    )
+    return Response({'success': True, 'event_id': str(ev.id)})
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def analytics_screen_end(request):
+    """
+    Close a ScreenViewEvent row and store duration.
+    Body:
+      - event_id: uuid (required)
+      - duration_seconds: int (optional; if not provided, computed via now-started_at)
+    """
+    from backend.models import ScreenViewEvent
+    event_id = (request.data.get('event_id') or '').strip()
+    if not event_id:
+        return Response({'success': False, 'message': 'event_id is required'}, status=400)
+
+    try:
+        ev = ScreenViewEvent.objects.get(id=event_id)
+    except ScreenViewEvent.DoesNotExist:
+        return Response({'success': False, 'message': 'event not found'}, status=404)
+
+    if ev.ended_at:
+        return Response({'success': True, 'message': 'already ended', 'duration_seconds': ev.duration_seconds})
+
+    dur = request.data.get('duration_seconds', None)
+    try:
+        if dur is not None:
+            dur_int = int(dur)
+            if dur_int < 0:
+                dur_int = 0
+        else:
+            dur_int = int((timezone.now() - ev.started_at).total_seconds())
+            if dur_int < 0:
+                dur_int = 0
+    except (ValueError, TypeError):
+        dur_int = int((timezone.now() - ev.started_at).total_seconds())
+        if dur_int < 0:
+            dur_int = 0
+
+    ev.ended_at = timezone.now()
+    ev.duration_seconds = dur_int
+    ev.save(update_fields=['ended_at', 'duration_seconds'])
+
+    return Response({'success': True, 'duration_seconds': ev.duration_seconds})
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def analytics_location_ping(request):
+    """
+    Store customer last known location (logged-in or guest by device_id).
+    Body:
+      - device_id: string (required)
+      - latitude: number (required)
+      - longitude: number (required)
+      - accuracy_m: number (optional)
+      - platform: string (optional)
+      - app_version: string (optional)
+    """
+    from backend.models import CustomerLocationPing
+
+    device_id = (request.data.get('device_id') or '').strip()
+    if not device_id:
+        return Response({'success': False, 'message': 'device_id is required'}, status=400)
+
+    lat = request.data.get('latitude')
+    lng = request.data.get('longitude')
+    try:
+        lat = float(lat)
+        lng = float(lng)
+    except (TypeError, ValueError):
+        return Response({'success': False, 'message': 'latitude/longitude must be numbers'}, status=400)
+
+    acc = request.data.get('accuracy_m', 0) or 0
+    try:
+        acc = float(acc)
+    except (TypeError, ValueError):
+        acc = 0.0
+
+    platform = (request.data.get('platform') or '').strip()
+    app_version = (request.data.get('app_version') or '').strip()
+
+    user = None
+    try:
+        if getattr(request, 'user', None) and getattr(request.user, 'is_authenticated', False):
+            user = request.user
+    except Exception:
+        user = None
+
+    CustomerLocationPing.objects.create(
+        user=user if getattr(user, 'id', None) else None,
+        device_id=device_id,
+        latitude=lat,
+        longitude=lng,
+        accuracy_m=acc,
+        platform=platform[:20],
+        app_version=app_version[:40],
+    )
+
+    return Response({'success': True})
 
 
 # Authentication APIs (existing code kept intact)
@@ -139,26 +313,157 @@ def verify_otp(request):
 
 @api_view(['POST'])
 def create_account(request):
+    """
+    Create a new user account after OTP verification.
+    Extended with:
+    - Phone/email uniqueness validation
+    - Referral code support
+    - Device/IP tracking for fraud detection
+    - Automatic referral code generation
+    """
     email = request.data.get('email')
     phone = request.data.get('phone')
     password = request.data.get('password')
     fullname = request.data.get('fullname')
     fcmtoken = request.data.get('fcmtoken')
+    # App sends referral_code_input; accept both for compatibility
+    referral_code_input = (
+        request.data.get('referral_code_input') or request.data.get('referral_code') or ''
+    ).strip().upper()
+    device_id = (request.data.get('device_id') or '').strip()
 
-    if email and phone and password and fullname:
-        otp_obj = get_object_or_404(Otp, phone=phone, verified=True)
-        otp_obj.delete()
-
-        user = User()
-        user.email = email
-        user.phone = phone
-        user.fullname = fullname
-        user.password = make_password(password)
-        user.save()
-        return token_response(user, fcmtoken)
-
-    else:
+    if not all([email, phone, password, fullname]):
         return Response('data_missing', 400)
+
+    # Uniqueness checks (mirrors signup repo error messages)
+    if User.objects.filter(email=email).exists():
+        return Response('email already exists', 400)
+    if User.objects.filter(phone=phone).exists():
+        return Response('phone already exists', 400)
+
+    # Ensure OTP was verified
+    otp_obj = get_object_or_404(Otp, phone=phone, verified=True)
+
+    # Determine signup IP
+    xff = request.META.get('HTTP_X_FORWARDED_FOR')
+    if xff:
+        signup_ip = xff.split(',')[0].strip()
+    else:
+        signup_ip = request.META.get('REMOTE_ADDR')
+
+    referred_by = None
+    referral_record = None
+
+    # Load referral settings (with safe defaults)
+    from backend.models import ReferralSettings, Referral
+    settings_obj = ReferralSettings.get_active()
+    reward_amount = settings_obj.referral_reward_amount if settings_obj else 100
+    max_referrals_per_day = settings_obj.max_referrals_per_day if settings_obj else 5
+
+    # Resolve referrer if referral code provided
+    log = logging.getLogger(__name__)
+    referred_by = None
+    if referral_code_input:
+        log.info('[Referral] create_account: referral_code_input=%s, new_user_phone=%s, new_user_email=%s',
+                 referral_code_input, phone, email)
+        referred_by = User.objects.filter(referral_code=referral_code_input).first()
+        if not referred_by:
+            log.warning('[Referral] create_account: invalid_referral_code=%s (no user found)', referral_code_input)
+            return Response('invalid_referral_code', 400)
+
+        # Prevent self-referral by phone/email (extra safety)
+        if referred_by.phone == phone or referred_by.email == email:
+            log.warning('[Referral] create_account: self_referral blocked, referrer=%s', referred_by.email)
+            return Response('self_referral_not_allowed', 400)
+
+    # Create user first so we can assign generated referral_code
+    user = User(
+        email=email,
+        phone=phone,
+        fullname=fullname,
+        password=make_password(password),
+        referred_by=referred_by,
+        device_id=device_id or None,
+        signup_ip=signup_ip,
+    )
+
+    # Generate unique referral code (USERNAME + random numbers style)
+    base_name = (fullname or email or '').strip().upper().replace(' ', '')
+    if not base_name:
+        base_name = f"USER{phone[-4:]}" if phone else "USER"
+    base_name = base_name[:8]
+
+    from random import randint
+    for _ in range(10):
+        suffix = str(randint(1000, 9999))
+        code = f"{base_name}{suffix}"
+        if not User.objects.filter(referral_code=code).exists():
+            user.referral_code = code
+            break
+
+    user.save()
+    otp_obj.delete()
+
+    # Create referral record if applicable
+    if referred_by:
+        # Daily referral limit per referrer
+        today = timezone.now().date()
+        from backend.models import WalletTransaction  # imported to keep admin/usage consistent
+        todays_count = Referral.objects.filter(
+            referrer=referred_by,
+            created_at__date=today,
+        ).exclude(status=Referral.STATUS_REJECTED).count()
+
+        is_suspicious = False
+        fraud_reason = ''
+
+        if max_referrals_per_day and todays_count >= max_referrals_per_day:
+            is_suspicious = True
+            fraud_reason = 'Daily referral limit exceeded'
+
+        # Device/IP based basic fraud flags
+        if device_id:
+            existing_same_device = User.objects.filter(device_id=device_id).exclude(id=user.id).count()
+            if existing_same_device >= 1:
+                is_suspicious = True
+                fraud_reason = (fraud_reason + '; ' if fraud_reason else '') + 'Multiple accounts on same device'
+
+        if signup_ip:
+            existing_same_ip = User.objects.filter(signup_ip=signup_ip).exclude(id=user.id).count()
+            if existing_same_ip >= 3:
+                is_suspicious = True
+                fraud_reason = (fraud_reason + '; ' if fraud_reason else '') + 'Too many signups from same IP'
+
+        referral_record = Referral.objects.create(
+            referrer=referred_by,
+            referred_user=user,
+            referral_code=referral_code_input,
+            reward_amount=reward_amount,
+            status=Referral.STATUS_PENDING if not is_suspicious else Referral.STATUS_REJECTED,
+            is_suspicious=is_suspicious,
+            fraud_reason=fraud_reason,
+            device_id=device_id or '',
+            signup_ip=signup_ip,
+        )
+        log.info('[Referral] create_account: Referral created id=%s, referrer=%s, referred=%s, status=%s',
+                 referral_record.id, referred_by.email, user.email, referral_record.status)
+
+        # Push notification to referrer when a friend signs up with their code
+        try:
+            from backend.fcm_utils import send_fcm_to_user
+            friend_name = user.fullname or user.email or user.phone or 'Your friend'
+            friend_name = str(friend_name)[:50]
+            reward_str = str(int(reward_amount)) if reward_amount else '100'
+            send_fcm_to_user(
+                referred_by,
+                'New referral joined 🎉',
+                f'{friend_name} signed up using your referral code. You will earn ₹{reward_str} after their first order is delivered.',
+                data={'screen': 'referral', 'type': 'referral_signup'},
+            )
+        except Exception as e:
+            log.warning('[Referral] create_account: failed to send signup push: %s', e)
+
+    return token_response(user, fcmtoken)
 
 
 @api_view(['POST'])
@@ -2706,7 +3011,6 @@ def get_page_items_by_category(request, category_id):
         # Get product options with their details
         product_options_data = []
         for option in page_item.product_options.all():
-            # Get first image
             first_image = option.images_set.first()
             image_url = None
             if first_image and request:
@@ -2714,11 +3018,24 @@ def get_page_items_by_category(request, category_id):
             elif first_image:
                 image_url = first_image.image.url
 
+            # Use option rent price/offer for card (Option price 200, Option offer 150), not product/buy price
+            price_val = option.get_price() or 0
+            offer_val = option.get_offer_price() or 0
+            effective_price = offer_val if (offer_val > 0 and price_val and offer_val < price_val) else price_val
+            cutted_price = price_val if (offer_val > 0 and price_val and offer_val < price_val) else None
+            discount_percentage = round(((price_val - effective_price) / price_val) * 100) if cutted_price and price_val > 0 else 0
+
             product_data = {
                 'id': str(option.product.id),
                 'title': f"({option.option}) {option.product.title}" if option.option else option.product.title,
-                'price': option.product.price,
-                'offer_price': option.product.offer_price,
+                'price': price_val,
+                'offer_price': offer_val,
+                'effective_price': effective_price,
+                'cutted_price': cutted_price,
+                'discount_percentage': discount_percentage,
+                'option_price': option.option_price if option.option_price > 0 else None,
+                'buy_price': option.get_buy_price(),
+                'rental_price_per_day': option.get_rental_price('1_day'),
                 'image': image_url,
             }
             product_options_data.append(product_data)
@@ -2765,7 +3082,6 @@ def get_categories_with_page_items(request):
             # Get product options with their details
             product_options_data = []
             for option in page_item.product_options.all()[:8]:  # Limit to 8 products per page item
-                # Get first image
                 first_image = option.images_set.first()
                 image_url = None
                 if first_image and request:
@@ -2773,11 +3089,23 @@ def get_categories_with_page_items(request):
                 elif first_image:
                     image_url = first_image.image.url
 
+                price_val = option.get_price() or 0
+                offer_val = option.get_offer_price() or 0
+                effective_price = offer_val if (offer_val > 0 and price_val and offer_val < price_val) else price_val
+                cutted_price = price_val if (offer_val > 0 and price_val and offer_val < price_val) else None
+                discount_percentage = round(((price_val - effective_price) / price_val) * 100) if cutted_price and price_val > 0 else 0
+
                 product_data = {
                     'id': str(option.product.id),
                     'title': f"({option.option}) {option.product.title}" if option.option else option.product.title,
-                    'price': option.product.price,
-                    'offer_price': option.product.offer_price,
+                    'price': price_val,
+                    'offer_price': offer_val,
+                    'effective_price': effective_price,
+                    'cutted_price': cutted_price,
+                    'discount_percentage': discount_percentage,
+                    'option_price': option.option_price if option.option_price > 0 else None,
+                    'buy_price': option.get_buy_price(),
+                    'rental_price_per_day': option.get_rental_price('1_day'),
                     'image': image_url,
                 }
                 product_options_data.append(product_data)
@@ -2789,6 +3117,8 @@ def get_categories_with_page_items(request):
                 'viewtype': page_item.viewtype,
                 'image': request.build_absolute_uri(page_item.image.url) if page_item.image and request else (
                     page_item.image.url if page_item.image else None),
+                'category': page_item.category.name,
+                'category_id': page_item.category.id,
                 'product_options': product_options_data
             }
             page_items_data.append(page_item_data)
@@ -2965,68 +3295,70 @@ def product_details(request, product_id):
 @permission_classes([IsAuthenticatedUser])
 def apply_coupon(request):
     """
-    Apply a coupon code to get discount
+    Apply a coupon code and get discount. Uses Coupon model (admin-created).
+
+    POST /api/cart/apply-coupon/
+    Request: {
+        "coupon_code": "FIRST50",
+        "cart_total": 1500,
+        "products": ["uuid1", "uuid2"],   # optional: product_option ids in cart
+        "product_ids": ["uuid1", "uuid2"], # optional: product ids (if not using products)
+        "services": ["uuid1"]              # optional: service ids if cart has services
+    }
+    Success: { "success": true, "discount": 200, "final_total": 1300, "message": "...", "coupon_code": "..." }
+    Invalid: { "success": false, "message": "Invalid or expired coupon code" }
     """
+    from backend.utils import validate_coupon_and_calculate_discount
+
     user = request.user
-    coupon_code = request.data.get('coupon_code', '').strip().upper()
+    data = request.data
+    coupon_code = data.get('coupon_code', '').strip()
+    cart_total = data.get('cart_total')
 
-    if not coupon_code:
-        return Response({'error': 'Coupon code is required'}, status=400)
+    if cart_total is None:
+        # Fallback: compute cart total from user's CartItem
+        cart_items = CartItem.objects.filter(user=user).select_related(
+            'product_option', 'product_option__product'
+        )
+        cart_total = 0
+        product_option_ids = []
+        for item in cart_items:
+            cart_total += (item.rental_price or 0) * item.quantity
+            product_option_ids.append(str(item.product_option_id))
+    else:
+        cart_total = int(cart_total)
+        product_option_ids = data.get('products') or []
+        if product_option_ids and isinstance(product_option_ids[0], str):
+            product_option_ids = [pid.strip() for pid in product_option_ids if pid]
 
-    # Get user's cart items to calculate discount on
-    cart_items = user.cart.select_related('product').all()
+    product_ids = data.get('product_ids') or []
+    if product_ids and isinstance(product_ids[0], str):
+        product_ids = [pid.strip() for pid in product_ids if pid]
+    service_ids = data.get('services') or []
+    if service_ids and isinstance(service_ids[0], str):
+        service_ids = [sid.strip() for sid in service_ids if sid]
 
-    if not cart_items:
-        return Response({'error': 'Cart is empty'}, status=400)
-
-    # Calculate cart total
-    cart_total = sum(
-        item.product.offer_price if item.product.offer_price > 0 else item.product.price
-        for item in cart_items
+    success, message, discount_amount, final_total, coupon_obj = validate_coupon_and_calculate_discount(
+        coupon_code=coupon_code,
+        user=user,
+        cart_total=cart_total,
+        product_option_ids=product_option_ids or None,
+        product_ids=product_ids or None,
+        service_ids=service_ids or None,
     )
 
-    # Define available coupons (you can move this to a database model later)
-    available_coupons = {
-        'WELCOME10': {'discount_percent': 10, 'min_amount': 500, 'max_discount': 200},
-        'SAVE20': {'discount_percent': 20, 'min_amount': 1000, 'max_discount': 500},
-        'FLAT50': {'discount_amount': 50, 'min_amount': 300, 'max_discount': 50},
-        'NEWUSER': {'discount_percent': 15, 'min_amount': 800, 'max_discount': 300},
-        'FESTIVAL25': {'discount_percent': 25, 'min_amount': 1500, 'max_discount': 750},
-    }
-
-    if coupon_code not in available_coupons:
+    if success:
         return Response({
-            'success': False,
-            'message': 'Invalid coupon code',
-            'discount_amount': 0
-        }, status=400)
-
-    coupon = available_coupons[coupon_code]
-
-    # Check minimum amount requirement
-    if cart_total < coupon['min_amount']:
-        return Response({
-            'success': False,
-            'message': f'Minimum order value of Ã¢â€šÂ¹{coupon["min_amount"]} required for this coupon',
-            'discount_amount': 0
-        }, status=400)
-
-    # Calculate discount
-    if 'discount_percent' in coupon:
-        discount_amount = (cart_total * coupon['discount_percent']) / 100
-    else:
-        discount_amount = coupon.get('discount_amount', 0)
-
-    # Apply maximum discount limit
-    discount_amount = min(discount_amount, coupon['max_discount'])
-    discount_amount = int(discount_amount)  # Convert to integer
-
+            'success': True,
+            'discount': discount_amount,
+            'final_total': final_total,
+            'message': message,
+            'coupon_code': (coupon_obj.code if coupon_obj else coupon_code),
+        })
     return Response({
-        'success': True,
-        'message': f'Coupon applied successfully! You saved Ã¢â€šÂ¹{discount_amount}',
-        'discount_amount': discount_amount,
-        'coupon_code': coupon_code
-    })
+        'success': False,
+        'message': message or 'Invalid or expired coupon code',
+    }, status=400)
 
 
 @api_view(['POST'])
@@ -3304,6 +3636,7 @@ def get_cart_items_enhanced(request):
         offer_amount = 0
         total_savings = 0
         delivery_charges = 0
+        total_security_amount = 0
 
         for idx, cart_item in enumerate(cart_items_db, 1):
             print(f"\n  Processing item {idx}/{cart_items_db.count()}:")
@@ -3409,6 +3742,10 @@ def get_cart_items_enhanced(request):
             item_delivery = int(product.delivery_charge) if product.delivery_charge else 0
             delivery_charges += item_delivery
 
+            # Security amount (per product, × quantity)
+            item_security = int(getattr(product, 'security_amount', 0) or 0)
+            total_security_amount += item_security * item_quantity
+
             print(f"    🔢 Quantity: {item_quantity}")
             print(f"    💰 Item total: ₹{rental_price * item_quantity}")
 
@@ -3438,13 +3775,15 @@ def get_cart_items_enhanced(request):
                 'rental_duration': str(cart_item.rental_duration) if cart_item.rental_duration else '',
                 'rental_price': rental_price,  # ✅ Guaranteed to be valid int
                 'rental_end_date': rental_end_date,
+                'security_amount': item_security,
+                'security_total': item_security * item_quantity,
             }
 
             cart_data.append(item_data)
             print(f"    ✅ Item added to cart response")
 
-        # Calculate final amounts
-        final_amount = offer_amount + delivery_charges
+        # Calculate final amounts (include security deposit in total payable)
+        final_amount = offer_amount + delivery_charges + total_security_amount
 
         # ✅ Free delivery logic
         free_delivery_threshold = 500
@@ -3453,7 +3792,7 @@ def get_cart_items_enhanced(request):
 
         if free_delivery_eligible:
             delivery_charges = 0
-            final_amount = offer_amount
+            final_amount = offer_amount + total_security_amount
             print(f"\n🎉 FREE DELIVERY UNLOCKED!")
         else:
             print(f"\n💰 Add ₹{amount_for_free_delivery} more for free delivery")
@@ -3477,6 +3816,7 @@ def get_cart_items_enhanced(request):
                 'offer_amount': int(offer_amount),
                 'total_savings': int(total_savings),
                 'delivery_charges': int(delivery_charges),
+                'security_amount': int(total_security_amount),
                 'final_amount': int(final_amount),
                 'total_items': len(cart_data),
                 'free_delivery_threshold': free_delivery_threshold,
@@ -3507,6 +3847,7 @@ def get_cart_items_enhanced(request):
                 'offer_amount': 0,
                 'total_savings': 0,
                 'delivery_charges': 0,
+                'security_amount': 0,
                 'final_amount': 0,
                 'total_items': 0,
                 'free_delivery_threshold': 500,
@@ -4651,6 +4992,15 @@ def add_address(request):
                     'success': False,
                     'message': 'Invalid pincode format'
                 }, status=400)
+            # Validate pincode is in serviceable locations
+            from backend.utils import check_pincode_serviceability
+            is_serviceable, _, serviceability_message = check_pincode_serviceability(pincode_int)
+            if not is_serviceable:
+                return Response({
+                    'success': False,
+                    'message': 'We are not providing our services in your location yet. Coming soon!',
+                    'is_location_not_serviceable': True
+                }, status=400)
 
         # Check if this is the first address for the user
         existing_addresses_count = UserAddress.objects.filter(user=user).count()
@@ -4784,6 +5134,15 @@ def update_address(request, address_id):
                 return Response({
                     'success': False,
                     'message': 'Invalid pincode format'
+                }, status=400)
+            # Validate pincode is in serviceable locations
+            from backend.utils import check_pincode_serviceability
+            is_serviceable, _, _ = check_pincode_serviceability(pincode_int)
+            if not is_serviceable:
+                return Response({
+                    'success': False,
+                    'message': 'We are not providing our services in your location yet. Coming soon!',
+                    'is_location_not_serviceable': True
                 }, status=400)
 
         # Update fields
@@ -5173,7 +5532,7 @@ def create_order(request):
                     'delivery_price': delivery_charge,
                 })
 
-            # Create Order
+            # Create Order (initial total before wallet usage)
             order = Order.objects.create(
                 user=user,
                 tx_amount=total_amount,
@@ -5575,6 +5934,7 @@ def create_service_booking(request):
     customer_phone = request.data.get('customer_phone')
     customer_address = request.data.get('customer_address')
     notes = request.data.get('notes', '')
+    coupon_code = (request.data.get('coupon_code') or '').strip().upper()
 
     # Validate required fields
     if not all([service_option_id, booking_date_str, booking_time_str,
@@ -5647,6 +6007,24 @@ def create_service_booking(request):
             'message': 'This time slot is already booked'
         }, status=400)
 
+    # Apply coupon if provided (validate and get discounted amount)
+    total_amount = service_option.price
+    coupon_obj = None
+    if coupon_code:
+        from backend.utils import validate_coupon_and_calculate_discount
+        success, msg, discount_amount, final_total, coupon_obj = validate_coupon_and_calculate_discount(
+            coupon_code=coupon_code,
+            user=user,
+            cart_total=service_option.price,
+            service_ids=[str(service.id)],
+        )
+        if not success:
+            return Response({
+                'success': False,
+                'message': msg or 'Invalid or expired coupon code',
+            }, status=400)
+        total_amount = final_total
+
     try:
         # Create the booking
         booking = ServiceBooking.objects.create(
@@ -5658,11 +6036,50 @@ def create_service_booking(request):
             customer_name=customer_name,
             customer_phone=customer_phone,
             customer_address=customer_address,
-            total_amount=service_option.price,
+            total_amount=total_amount,
             notes=notes,
             status='PENDING',
             payment_status='PENDING'
         )
+
+        # Record coupon usage and increment used_count (so limit counts both orders and service bookings)
+        if coupon_obj:
+            from backend.models import CouponUsage
+            CouponUsage.objects.create(
+                user=user,
+                coupon=coupon_obj,
+                order=None,
+                service_booking=booking,
+            )
+            coupon_obj.used_count += 1
+            coupon_obj.save(update_fields=['used_count', 'updated_at'])
+
+        # Apply referral wallet (after coupon)
+        settings_obj = ReferralSettings.get_active()
+        max_wallet_percent = settings_obj.max_wallet_usage_percent if settings_obj else 20
+        requested_wallet_amount = int(request.data.get('wallet_amount') or 0)
+        wallet_balance = int(user.referral_wallet_balance or 0)
+        max_wallet_from_percent = int(total_amount * max_wallet_percent / 100) if max_wallet_percent > 0 else 0
+        wallet_to_use = max(0, min(wallet_balance, requested_wallet_amount, max_wallet_from_percent, int(total_amount)))
+
+        if wallet_to_use > 0:
+            # Deduct from user wallet
+            new_balance = wallet_balance - wallet_to_use
+            user.referral_wallet_balance = new_balance
+            user.save(update_fields=['referral_wallet_balance'])
+
+            # Update booking amount
+            booking.total_amount = int(total_amount) - wallet_to_use
+            booking.save(update_fields=['total_amount'])
+
+            # Ledger entry
+            WalletTransaction.objects.create(
+                user=user,
+                amount=wallet_to_use,
+                type=WalletTransaction.TYPE_DEBIT,
+                description="Used in service booking",
+                service_booking=booking,
+            )
 
         # Serialize the created booking
         booking_data = {
@@ -5675,6 +6092,7 @@ def create_service_booking(request):
             'customer_phone': booking.customer_phone,
             'customer_address': booking.customer_address,
             'total_amount': booking.total_amount,
+            'wallet_used': wallet_to_use if 'wallet_to_use' in locals() else 0,
             'status': booking.status,
             'payment_status': booking.payment_status,
             'created_at': booking.created_at.isoformat() if hasattr(booking,
@@ -6613,7 +7031,7 @@ def vendor_create_product(request):
 
         # Date Booking Settings
         "requires_date_selection": true,
-        "max_bookings_per_date": 10
+        "max_bookings_per_date": 1
     }
     """
     vendor = request.user
@@ -6731,7 +7149,7 @@ def vendor_create_product(request):
 
             # Date booking settings
             requires_date_selection=data.get('requires_date_selection', True),
-            max_bookings_per_date=int(data.get('max_bookings_per_date', 10))
+            max_bookings_per_date=int(data.get('max_bookings_per_date', 1))
         )
 
         # Build response with all pricing info
@@ -7038,6 +7456,8 @@ def vendor_create_product_option(request):
 
         # Auto-calculation toggle
         auto_calculate = data.get('auto_calculate_rental_prices', True)
+        is_rent_available = data.get('is_rent_available', data.get('rent_available', True))
+        is_buy_available = data.get('is_buy_available', data.get('buy_available', True))
 
         # Validate pricing logic
         if option_price > 0 and option_offer_price > option_price:
@@ -7082,7 +7502,9 @@ def vendor_create_product_option(request):
             option_buy_offer_price=option_buy_offer_price,
 
             # Auto-calculation
-            auto_calculate_rental_prices=auto_calculate
+            auto_calculate_rental_prices=auto_calculate,
+            is_rent_available=is_rent_available,
+            is_buy_available=is_buy_available,
         )
 
         print(f"âœ… Product option created: {product_option.id}")
@@ -7095,6 +7517,8 @@ def vendor_create_product_option(request):
             'id': str(product_option.id),
             'option': product_option.option,
             'quantity': product_option.quantity,
+            'is_rent_available': product_option.is_rent_available,
+            'is_buy_available': product_option.is_buy_available,
             'product': str(product_option.product.id),
 
             # Standard pricing
@@ -7170,6 +7594,10 @@ def vendor_update_product_option(request, option_id):
                     'message': 'Quantity cannot be negative'
                 }, status=400)
             product_option.quantity = quantity
+        if 'is_rent_available' in data or 'rent_available' in data:
+            product_option.is_rent_available = data.get('is_rent_available', data.get('rent_available'))
+        if 'is_buy_available' in data or 'buy_available' in data:
+            product_option.is_buy_available = data.get('is_buy_available', data.get('buy_available'))
 
         # Update standard pricing
         if 'option_price' in data:
@@ -7225,6 +7653,8 @@ def vendor_update_product_option(request, option_id):
             'id': str(product_option.id),
             'option': product_option.option,
             'quantity': product_option.quantity,
+            'is_rent_available': product_option.is_rent_available,
+            'is_buy_available': product_option.is_buy_available,
             'product': str(product_option.product.id),
 
             # Standard pricing
@@ -7413,7 +7843,34 @@ def vendor_get_categories(request):
     """
     Get all categories for dropdown - Vendor access
     """
+    vendor = request.user
+    # Support multi-pincode vendors via Vendor.serviceable_locations.
+    # Fallback to legacy Vendor.pincode if no locations selected.
+    pincodes = []
+    try:
+        if getattr(vendor, 'serviceable_locations', None) is not None:
+            pincodes = list(
+                vendor.serviceable_locations.filter(is_active=True).values_list('pincode', flat=True)
+            )
+    except Exception:
+        pincodes = []
+
+    if not pincodes:
+        pincode = (getattr(vendor, 'pincode', '') or '').strip()
+        if pincode:
+            pincodes = [pincode]
+
     categories = Category.objects.all().order_by('position')
+
+    # If vendor has pincodes, show ONLY categories explicitly enabled for any of those pincodes.
+    # This matches admin intent: selecting locations decides where category appears.
+    if pincodes:
+        categories = categories.filter(
+            location_availability__location__pincode__in=pincodes,
+            location_availability__location__is_active=True,
+            location_availability__is_available=True,
+        ).distinct().order_by('position')
+
     categories_data = CategorySerializer(
         categories,
         many=True,
@@ -7615,6 +8072,10 @@ def product_details_with_dates(request, product_id):
             'business_address': product.vendor.business_address,
         }
 
+    trial_available = True
+    if product.vendor is not None:
+        trial_available = bool(getattr(product.vendor, 'trial_enabled', False))
+
     # Get booked dates with calendar structure
     calendar_data = _get_calendar_data(product)
 
@@ -7651,6 +8112,7 @@ def product_details_with_dates(request, product_id):
         'max_bookings_per_date': product.max_bookings_per_date,
         'rental_pricing': product_rental_pricing,
         'vendor_info': vendor_info,
+        'trial_available': trial_available,
         'calendar_data': calendar_data,
 
         # ✅ ENHANCED: Ratings with review text
@@ -8343,6 +8805,13 @@ def create_order_with_bookings(request):
             'message': 'Payment mode and address are required'
         }, status=400)
 
+    # Terms & Conditions must be accepted to place order
+    if not data.get('accepted_terms'):
+        return Response({
+            'success': False,
+            'message': 'You must accept the Terms & Conditions to place an order'
+        }, status=400)
+
     try:
         with transaction.atomic():
             # Calculate total amount and validate items
@@ -8476,6 +8945,8 @@ def create_order_with_bookings(request):
                 item_total = (rental_price * quantity) + delivery_charge
                 total_amount += item_total
 
+                item_security = int(getattr(product, 'security_amount', 0) or 0) * quantity
+
                 print(
                     f"📊 Item total: ₹{item_total} (price: ₹{rental_price} x {quantity} + delivery: ₹{delivery_charge})")
 
@@ -8485,6 +8956,7 @@ def create_order_with_bookings(request):
                     'product_price': product.price,
                     'tx_price': rental_price,
                     'delivery_price': delivery_charge,
+                    'security_amount': item_security,
                     'selected_date': selected_date,
                     'rental_type': rental_type,
                     'rental_duration': rental_duration,
@@ -8492,7 +8964,93 @@ def create_order_with_bookings(request):
                     'rental_end_date': rental_end_date
                 })
 
-            print(f"💵 Total order amount: ₹{total_amount}")
+            total_security = sum(item.get('security_amount', 0) for item in items_to_order)
+            print(f"💵 Total order amount: ₹{total_amount}, Security: ₹{total_security}")
+
+            # Coupon: validate and apply discount (re-validate at order creation for security)
+            coupon_code = (data.get('coupon_code') or '').strip().upper()
+            coupon_obj = None
+            discount_amount = 0
+            if coupon_code:
+                from backend.utils import validate_coupon_and_calculate_discount
+                product_option_ids_order = [str(item['product_option'].id) for item in items_to_order]
+                success, msg, discount_amount, final_total, coupon_obj = validate_coupon_and_calculate_discount(
+                    coupon_code=coupon_code,
+                    user=user,
+                    cart_total=total_amount,
+                    product_option_ids=product_option_ids_order,
+                )
+                if not success:
+                    return Response({
+                        'success': False,
+                        'message': msg or 'Invalid or expired coupon code',
+                    }, status=400)
+                total_amount = final_total
+                print(f"🎟️ Coupon applied: {coupon_code}, discount ₹{discount_amount}, final ₹{total_amount}")
+
+            # Trial-at-home upsell discount (after coupon, before wallet)
+            trial_booking_id = data.get('trial_booking_id')
+            trial_discount_applied = 0
+            trial_obj = None
+            if trial_booking_id:
+                from backend.models import TrialSettings, TrialBooking
+                trial_settings = TrialSettings.get_active()
+                if not trial_settings or not bool(trial_settings.trial_discount_enabled):
+                    return Response({
+                        'success': False,
+                        'message': 'Trial discount is currently disabled',
+                    }, status=400)
+
+                try:
+                    trial_obj = TrialBooking.objects.select_for_update().prefetch_related('items').get(id=trial_booking_id)
+                except TrialBooking.DoesNotExist:
+                    return Response({
+                        'success': False,
+                        'message': 'Trial booking not found',
+                    }, status=404)
+
+                if trial_obj.user_id != user.id:
+                    return Response({
+                        'success': False,
+                        'message': 'Trial booking does not belong to this user',
+                    }, status=403)
+
+                if trial_obj.payment_status != TrialBooking.PAYMENT_PAID:
+                    return Response({
+                        'success': False,
+                        'message': 'Trial booking is not paid',
+                    }, status=400)
+
+                if trial_obj.status == TrialBooking.STATUS_CANCELLED:
+                    return Response({
+                        'success': False,
+                        'message': 'Trial booking is cancelled and cannot be converted',
+                    }, status=400)
+
+                if trial_obj.converted_order_id:
+                    return Response({
+                        'success': False,
+                        'message': 'This trial booking has already been used',
+                    }, status=400)
+
+                trial_option_ids = set(str(it.dress_id) for it in trial_obj.items.all())
+                ordered_option_ids = set(str(item['product_option'].id) for item in items_to_order)
+
+                # Must order only dresses from the trial booking (prevents "different dress" abuse)
+                if not ordered_option_ids:
+                    return Response({'success': False, 'message': 'No order items found'}, status=400)
+
+                if not ordered_option_ids.issubset(trial_option_ids):
+                    return Response({
+                        'success': False,
+                        'message': 'Trial discount only applies to dresses selected in the trial booking',
+                    }, status=400)
+
+                trial_fee_int = int(trial_obj.trial_fee or 0)
+                if trial_fee_int > 0:
+                    trial_discount_applied = min(trial_fee_int, int(total_amount))
+                    total_amount = int(total_amount) - int(trial_discount_applied)
+                    discount_amount = int(discount_amount) + int(trial_discount_applied)
 
             # Set expected_delivery
             if earliest_delivery_date:
@@ -8517,9 +9075,56 @@ def create_order_with_bookings(request):
                 latitude=data.get('latitude'),
                 longitude=data.get('longitude'),
                 expected_delivery=expected_delivery_str,
+                coupon=coupon_obj,
+                discount_amount=discount_amount,
+                trial_booking=trial_obj,
+                security_amount=total_security,
+                accepted_terms=True,
+                accepted_at=timezone.now(),
             )
 
             print(f"✅ Order created: {order.id}")
+
+            # Mark trial as converted (one-time use)
+            if trial_obj:
+                trial_obj.converted_order = order
+                trial_obj.converted_at = timezone.now()
+                trial_obj.save(update_fields=['converted_order', 'converted_at', 'updated_at'])
+
+            # Apply referral wallet (after coupon)
+            settings_obj = ReferralSettings.get_active()
+            max_wallet_percent = settings_obj.max_wallet_usage_percent if settings_obj else 20
+            requested_wallet_amount = int(data.get('wallet_amount') or 0)
+            wallet_balance = int(user.referral_wallet_balance or 0)
+            max_wallet_from_percent = int(total_amount * max_wallet_percent / 100) if max_wallet_percent > 0 else 0
+            wallet_to_use = max(0, min(wallet_balance, requested_wallet_amount, max_wallet_from_percent, int(total_amount)))
+
+            if wallet_to_use > 0:
+                # Deduct from user wallet
+                new_balance = wallet_balance - wallet_to_use
+                user.referral_wallet_balance = new_balance
+                user.save(update_fields=['referral_wallet_balance'])
+
+                # Update order amount
+                order.tx_amount = int(total_amount) - wallet_to_use
+                order.save(update_fields=['tx_amount'])
+
+                # Ledger entry
+                WalletTransaction.objects.create(
+                    user=user,
+                    amount=wallet_to_use,
+                    type=WalletTransaction.TYPE_DEBIT,
+                    description="Used in order",
+                    order=order,
+                )
+
+            # Record coupon usage and increment used_count
+            if coupon_obj:
+                from backend.models import CouponUsage
+                CouponUsage.objects.create(user=user, coupon=coupon_obj, order=order)
+                coupon_obj.used_count += 1
+                coupon_obj.save(update_fields=['used_count', 'updated_at'])
+                print(f"🎟️ Coupon usage recorded: {coupon_obj.code} (used {coupon_obj.used_count} times)")
 
             # ✅ UPGRADED: Create OrderedProduct entries AND decrease stock ONLY for purchases
             ordered_products = []
@@ -8593,11 +9198,59 @@ def create_order_with_bookings(request):
             except Exception as e:
                 print(f"Failed to create notification: {e}")
 
+            # Send vendor push notification for newly booked products
+            # (targets only the vendor(s) that own items in this order)
+            try:
+                from collections import defaultdict
+                from backend.fcm_utils import send_fcm_to_vendor
+
+                vendor_products_map = defaultdict(list)
+                for ordered_product in ordered_products:
+                    product = ordered_product.product_option.product
+                    vendor = getattr(product, 'vendor', None)
+                    if vendor:
+                        vendor_products_map[vendor].append(product.title)
+                        continue
+
+                    # Fallback: resolve vendor from VendorProduct mapping
+                    mapped_vendor_ids = VendorProduct.objects.filter(
+                        product=product
+                    ).values_list('vendor_id', flat=True)
+                    if not mapped_vendor_ids:
+                        continue
+                    mapped_vendors = Vendor.objects.filter(id__in=mapped_vendor_ids)
+                    for mapped_vendor in mapped_vendors:
+                        vendor_products_map[mapped_vendor].append(product.title)
+
+                for vendor, product_titles in vendor_products_map.items():
+                    unique_titles = list(dict.fromkeys(product_titles))
+                    titles_preview = ', '.join(unique_titles[:2])
+                    if len(unique_titles) > 2:
+                        titles_preview = f"{titles_preview} +{len(unique_titles) - 2} more"
+
+                    send_fcm_to_vendor(
+                        vendor,
+                        'New booking received',
+                        f'Order {str(order.id)[:8].upper()} includes: {titles_preview}',
+                        data={
+                            'type': 'vendor_new_booking',
+                            'screen': 'orders',
+                            'orderId': str(order.id),
+                            'vendorId': str(vendor.id),
+                        },
+                    )
+            except Exception as e:
+                print(f"Failed to send vendor push notification: {e}")
+
             # Prepare response
             order_data = {
                 'id': str(order.id),
                 'order_number': f"RCO{str(order.id)[:8].upper()}",
                 'total_amount': order.tx_amount,
+                'discount_amount': order.discount_amount,
+                'coupon_code': order.coupon.code if order.coupon else None,
+                'trial_booking_id': str(order.trial_booking_id) if order.trial_booking_id else None,
+                'trial_discount_applied': int(trial_discount_applied or 0),
                 'payment_mode': order.payment_mode,
                 'status': order.tx_status,
                 'requires_confirmation': has_date_based_products,
@@ -8679,6 +9332,457 @@ def _calculate_rental_price_from_option(product_option, rental_type, rental_dura
 
     # Get rental price from ProductOption (includes auto-calculation fallback)
     return product_option.get_rental_price(rental_duration)
+
+
+# =============================================================================
+# TRIAL AT HOME (Trial Booking + Upsell Discount)
+# =============================================================================
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticatedUser])
+def get_trial_settings(request):
+    """
+    Returns active trial-at-home settings for the app UI.
+    """
+    from backend.models import TrialSettings
+
+    settings_obj = TrialSettings.get_active()
+    if not settings_obj:
+        return Response({
+            'success': True,
+            'settings': {
+                'trial_enabled_areas': [],
+                'trial_fee': 0,
+                'max_trial_items': 0,
+                'trial_discount_enabled': False,
+                'trial_slots': [],
+            }
+        })
+
+    return Response({
+        'success': True,
+        'settings': {
+            # Trial availability is controlled per vendor, not by area/location.
+            'trial_enabled_areas': [],
+            'trial_fee': int(settings_obj.trial_fee or 0),
+            'max_trial_items': int(settings_obj.max_trial_items or 0),
+            'trial_discount_enabled': bool(settings_obj.trial_discount_enabled),
+            'trial_slots': list(settings_obj.trial_slots or []),
+        }
+    })
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticatedUser])
+def create_trial_booking(request):
+    """
+    Create a new trial booking.
+    Body:
+    {
+      "address": "...",
+      "area": "Area name",
+      "trial_date": "YYYY-MM-DD",
+      "time_slot": "morning",
+      "dress_ids": ["product_option_uuid", ...]
+    }
+    """
+    from django.utils import timezone
+    from backend.models import TrialSettings, TrialBooking, TrialItem, ProductOption
+
+    user = request.user
+    data = request.data or {}
+
+    settings_obj = TrialSettings.get_active()
+    if not settings_obj:
+        return Response({'success': False, 'message': 'Trial feature is not configured'}, status=400)
+
+    slots = list(settings_obj.trial_slots or [])
+    max_items = int(settings_obj.max_trial_items or 0)
+    fee = int(settings_obj.trial_fee or 0)
+
+    address = (data.get('address') or '').strip()
+    area = (data.get('area') or '').strip()
+    time_slot = (data.get('time_slot') or '').strip()
+    trial_date_str = (data.get('trial_date') or '').strip()
+    dress_ids = data.get('dress_ids') or data.get('product_option_ids') or []
+
+    if not address or not area or not time_slot or not trial_date_str:
+        return Response({'success': False, 'message': 'address, area, trial_date and time_slot are required'}, status=400)
+
+    if not isinstance(dress_ids, list) or not dress_ids:
+        return Response({'success': False, 'message': 'dress_ids must be a non-empty array'}, status=400)
+
+    if slots and time_slot not in slots:
+        return Response({'success': False, 'message': 'Invalid trial time slot'}, status=400)
+
+    if max_items and len(dress_ids) > max_items:
+        return Response({'success': False, 'message': f'Maximum {max_items} trial items allowed'}, status=400)
+
+    try:
+        trial_date = timezone.datetime.strptime(trial_date_str, '%Y-%m-%d').date()
+    except ValueError:
+        return Response({'success': False, 'message': 'Invalid trial_date format (YYYY-MM-DD)'}, status=400)
+
+    if trial_date < timezone.now().date():
+        return Response({'success': False, 'message': 'trial_date cannot be in the past'}, status=400)
+
+    # Validate dresses exist (ProductOption)
+    unique_ids = list(dict.fromkeys([str(x) for x in dress_ids]))
+    options = list(ProductOption.objects.filter(id__in=unique_ids).select_related('product', 'product__vendor'))
+    if len(options) != len(unique_ids):
+        return Response({'success': False, 'message': 'One or more dresses not found'}, status=404)
+
+    # Trial is controlled per vendor:
+    # - All selected items must belong to trial-enabled vendor(s)
+    # - For vendor workflow, enforce SINGLE vendor per trial booking
+    ineligible = []
+    vendor_ids = set()
+    chosen_vendor = None
+    for opt in options:
+        vendor = getattr(getattr(opt, 'product', None), 'vendor', None)
+        if vendor is None:
+            ineligible.append(str(opt.id))
+            continue
+        if not bool(getattr(vendor, 'trial_enabled', False)):
+            ineligible.append(str(opt.id))
+        vendor_ids.add(vendor.id)
+        chosen_vendor = vendor
+
+    if ineligible:
+        return Response(
+            {
+                'success': False,
+                'message': 'Trial is not available for one or more selected dresses (vendor trial disabled)',
+                'ineligible_dress_ids': ineligible,
+            },
+            status=400,
+        )
+
+    if len(vendor_ids) != 1:
+        return Response(
+            {
+                'success': False,
+                'message': 'Please select trial dresses from only one vendor at a time',
+            },
+            status=400,
+        )
+
+    with transaction.atomic():
+        trial = TrialBooking.objects.create(
+            user=user,
+            vendor=chosen_vendor,
+            address=address,
+            area=area,
+            trial_fee=fee,
+            payment_status=TrialBooking.PAYMENT_UNPAID,
+            status=TrialBooking.STATUS_PENDING,
+            trial_date=trial_date,
+            time_slot=time_slot,
+        )
+        TrialItem.objects.bulk_create([
+            TrialItem(trial=trial, dress_id=opt.id) for opt in options
+        ])
+
+    # Notify vendor (best-effort) so vendor app can buzz immediately.
+    try:
+        if trial.vendor_id:
+            from backend.fcm_utils import send_fcm_to_vendor
+            title = 'New trial booking'
+            body = f'New trial request for {trial.trial_date.strftime("%d %b")} {trial.time_slot}. Tap to view.'
+            send_fcm_to_vendor(
+                trial.vendor,
+                title,
+                body,
+                data={'screen': 'vendor_trial', 'type': 'trial_new', 'trial_id': str(trial.id)},
+            )
+    except Exception as e:
+        logger.warning('Trial vendor push failed (create): %s', e)
+
+    return Response({
+        'success': True,
+        'message': 'Trial booking created',
+        'trial_booking': {
+            'id': str(trial.id),
+            'trial_fee': int(trial.trial_fee or 0),
+            'payment_status': trial.payment_status,
+            'status': trial.status,
+            'trial_date': trial.trial_date.strftime('%Y-%m-%d'),
+            'time_slot': trial.time_slot,
+            'area': trial.area,
+            'items_count': len(options),
+        }
+    }, status=201)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticatedUser])
+def list_my_trial_bookings(request):
+    from backend.models import TrialBooking
+
+    user = request.user
+    qs = TrialBooking.objects.filter(user=user).order_by('-created_at').prefetch_related('items')
+    data = []
+    for t in qs:
+        data.append({
+            'id': str(t.id),
+            'area': t.area,
+            'address': t.address,
+            'trial_fee': int(t.trial_fee or 0),
+            'payment_status': t.payment_status,
+            'status': t.status,
+            'trial_date': t.trial_date.strftime('%Y-%m-%d'),
+            'time_slot': t.time_slot,
+            'converted_order_id': str(t.converted_order_id) if t.converted_order_id else None,
+            'items_count': t.items.count(),
+            'created_at': t.created_at.isoformat(),
+        })
+
+    return Response({'success': True, 'trial_bookings': data, 'total': len(data)})
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticatedUser])
+def trial_booking_detail(request, trial_id):
+    from backend.models import TrialBooking
+
+    user = request.user
+    try:
+        trial = TrialBooking.objects.prefetch_related('items__dress__product').get(id=trial_id)
+    except TrialBooking.DoesNotExist:
+        return Response({'success': False, 'message': 'Trial booking not found'}, status=404)
+
+    if trial.user_id != user.id:
+        return Response({'success': False, 'message': 'Forbidden'}, status=403)
+
+    items = []
+    for it in trial.items.all():
+        opt = it.dress
+        prod = getattr(opt, 'product', None)
+        items.append({
+            'dress_id': str(opt.id),
+            'title': str(opt),
+            'product_id': str(prod.id) if prod else None,
+        })
+
+    return Response({
+        'success': True,
+        'trial_booking': {
+            'id': str(trial.id),
+            'area': trial.area,
+            'address': trial.address,
+            'trial_fee': int(trial.trial_fee or 0),
+            'payment_status': trial.payment_status,
+            'status': trial.status,
+            'trial_date': trial.trial_date.strftime('%Y-%m-%d'),
+            'time_slot': trial.time_slot,
+            'converted_order_id': str(trial.converted_order_id) if trial.converted_order_id else None,
+            'items': items,
+            'created_at': trial.created_at.isoformat(),
+        }
+    })
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticatedUser])
+def mark_trial_booking_paid(request, trial_id):
+    """
+    Marks a trial booking as PAID (called after payment success).
+    """
+    from backend.models import TrialBooking
+
+    user = request.user
+    try:
+        with transaction.atomic():
+            trial = TrialBooking.objects.select_for_update().select_related('vendor').get(id=trial_id)
+            if trial.user_id != user.id:
+                return Response({'success': False, 'message': 'Forbidden'}, status=403)
+
+            if trial.payment_status == TrialBooking.PAYMENT_PAID:
+                return Response({'success': True, 'message': 'Already paid', 'payment_status': trial.payment_status})
+
+            trial.payment_status = TrialBooking.PAYMENT_PAID
+            trial.save(update_fields=['payment_status', 'updated_at'])
+    except TrialBooking.DoesNotExist:
+        return Response({'success': False, 'message': 'Trial booking not found'}, status=404)
+
+    # Notify vendor (best-effort)
+    try:
+        if trial.vendor_id:
+            from backend.fcm_utils import send_fcm_to_vendor
+            title = 'New trial booking'
+            body = f'New trial request for {trial.trial_date.strftime("%d %b")} {trial.time_slot}. Tap to view.'
+            send_fcm_to_vendor(
+                trial.vendor,
+                title,
+                body,
+                data={'screen': 'vendor_trial', 'type': 'trial_new', 'trial_id': str(trial.id)},
+            )
+    except Exception as e:
+        logger.warning('Trial vendor push failed: %s', e)
+
+    return Response({'success': True, 'message': 'Payment marked as paid', 'payment_status': trial.payment_status})
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticatedUser])
+def referral_info(request):
+    """
+    Returns current user's referral summary:
+    - referral_code
+    - wallet_balance
+    - total_earnings (sum of credits)
+    - total_referrals (all referrals made)
+    """
+    user = request.user
+    total_credits = WalletTransaction.objects.filter(
+        user=user,
+        type=WalletTransaction.TYPE_CREDIT
+    ).aggregate(total=Sum('amount'))['total'] or 0
+
+    total_referrals = Referral.objects.filter(referrer=user).count()
+
+    # Ensure user always has a referral_code (generate if missing)
+    if not user.referral_code:
+        base_name = (user.fullname or user.email or '').strip().upper().replace(' ', '') or f"USER{user.phone[-4:]}"
+        base_name = base_name[:8]
+        from random import randint
+        for _ in range(10):
+            code = f"{base_name}{randint(1000, 9999)}"
+            if not User.objects.filter(referral_code=code).exists():
+                user.referral_code = code
+                user.save(update_fields=['referral_code'])
+                break
+
+    settings_obj = ReferralSettings.get_active()
+    max_wallet_usage_percent = int(settings_obj.max_wallet_usage_percent) if settings_obj else 20
+    reward_per_friend = int(settings_obj.referral_reward_amount) if settings_obj and settings_obj.referral_reward_amount else 100
+
+    return Response({
+        'success': True,
+        'referral_code': user.referral_code,
+        'wallet_balance': str(user.referral_wallet_balance or 0),
+        'total_earnings': str(total_credits),
+        'total_referrals': total_referrals,
+        'max_wallet_usage_percent': max_wallet_usage_percent,
+        'reward_per_friend': reward_per_friend,
+    })
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticatedUser])
+def referral_history(request):
+    """
+    Returns list of referrals made by the current user.
+    Each item: friend_name, status, reward_amount, created_at, is_suspicious.
+    """
+    user = request.user
+    referrals = Referral.objects.filter(referrer=user).select_related('referred_user').order_by('-created_at')
+
+    history = []
+    for r in referrals:
+        friend_name = r.referred_user.fullname or r.referred_user.email or r.referred_user.phone
+        history.append({
+            'id': r.id,
+            'friend_name': friend_name,
+            'status': r.status,
+            'reward_amount': str(r.reward_amount),
+            'is_suspicious': r.is_suspicious,
+            'fraud_reason': r.fraud_reason,
+            'created_at': r.created_at.isoformat(),
+        })
+
+    return Response({
+        'success': True,
+        'referrals': history,
+        'total': len(history),
+    })
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticatedUser])
+def wallet_transactions(request):
+    """
+    Returns referral wallet transaction history for current user.
+    Supports simple pagination via ?page=&page_size=
+    """
+    user = request.user
+    try:
+        page = int(request.GET.get('page', 1))
+        page_size = int(request.GET.get('page_size', 50))
+    except ValueError:
+        page, page_size = 1, 50
+
+    qs = WalletTransaction.objects.filter(user=user).order_by('-created_at')
+    paginator = Paginator(qs, page_size)
+    try:
+        page_obj = paginator.page(page)
+    except (PageNotAnInteger, EmptyPage):
+        page_obj = paginator.page(1)
+
+    items = []
+    for tx in page_obj.object_list:
+        items.append({
+            'id': tx.id,
+            'amount': str(tx.amount),
+            'type': tx.type,
+            'description': tx.description,
+            'created_at': tx.created_at.isoformat(),
+            'order_id': str(tx.order_id) if tx.order_id else None,
+            'service_booking_id': str(tx.service_booking_id) if tx.service_booking_id else None,
+        })
+
+    return Response({
+        'success': True,
+        'wallet_balance': str(user.referral_wallet_balance or 0),
+        'transactions': items,
+        'pagination': {
+            'current_page': page_obj.number,
+            'total_pages': paginator.num_pages,
+            'total_items': paginator.count,
+            'page_size': page_size,
+            'has_next': page_obj.has_next(),
+            'has_previous': page_obj.has_previous(),
+        }
+    })
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticatedUser])
+def referral_share(request):
+    """
+    Generate a referral link for the current user.
+    """
+    user = request.user
+
+    # Ensure referral code exists
+    if not user.referral_code:
+        base_name = (user.fullname or user.email or '').strip().upper().replace(' ', '') or f"USER{user.phone[-4:]}"
+        base_name = base_name[:8]
+        from random import randint
+        for _ in range(10):
+            code = f"{base_name}{randint(1000, 9999)}"
+            if not User.objects.filter(referral_code=code).exists():
+                user.referral_code = code
+                user.save(update_fields=['referral_code'])
+                break
+
+    base_url = getattr(settings, 'REFERRAL_SIGNUP_BASE_URL', 'https://yourapp.com/signup')
+    # Append ref param: use & if base_url already has query params (e.g. Play Store), else ?
+    separator = "&" if "?" in base_url else "?"
+    referral_link = f"{base_url}{separator}ref={user.referral_code}"
+
+    share_message = (
+        f"Try our Rental Clothes app! Use my code {user.referral_code} "
+        f"and earn rewards on your first order. Sign up here: {referral_link}"
+    )
+
+    return Response({
+        'success': True,
+        'referral_code': user.referral_code,
+        'referral_link': referral_link,
+        'share_message': share_message,
+    })
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticatedUser])
@@ -8782,6 +9886,7 @@ def vendor_login(request):
     """
     email = request.data.get('email', '').strip()
     password = request.data.get('password', '')
+    fcm_token = (request.data.get('fcmtoken') or request.data.get('fcm_token') or '').strip()
 
     if not email or not password:
         return Response({
@@ -8806,7 +9911,7 @@ def vendor_login(request):
             VendorToken.objects.create(
                 token=token,
                 vendor=vendor,
-                fcmtoken=request.data.get('fcmtoken', '')
+                fcmtoken=fcm_token
             )
 
             return Response({
@@ -8871,6 +9976,48 @@ def vendor_logout(request):
         'success': False,
         'message': 'Logout failed'
     }, status=400)
+
+
+@api_view(['POST'])
+@authentication_classes([VendorTokenAuthentication])
+@permission_classes([IsAuthenticatedVendor])
+def vendor_save_device_token(request):
+    """
+    Save/update FCM token for current authenticated vendor session.
+    POST /api/vendor/save-device-token/
+    Body: {"fcm_token": "..."} or {"fcmtoken": "..."}
+    """
+    fcm_token = request.data.get('fcm_token') or request.data.get('fcmtoken')
+    if not fcm_token or not str(fcm_token).strip():
+        return Response({
+            'success': False,
+            'message': 'fcm_token is required'
+        }, status=400)
+
+    token_header = request.headers.get('Authorization', '')
+    token_parts = str(token_header).split()
+    if len(token_parts) != 2:
+        return Response({
+            'success': False,
+            'message': 'Invalid Authorization header'
+        }, status=400)
+
+    token_value = token_parts[1]
+    updated = VendorToken.objects.filter(
+        token=token_value,
+        vendor=request.user
+    ).update(fcmtoken=str(fcm_token).strip())
+
+    if not updated:
+        return Response({
+            'success': False,
+            'message': 'Vendor token not found'
+        }, status=404)
+
+    return Response({
+        'success': True,
+        'message': 'Vendor device token saved'
+    })
 
 
 
@@ -9323,7 +10470,29 @@ def vendor_product_detail(request, product_id):
 @vendor_required
 def vendor_categories(request):
     """Get all categories"""
+    vendor = getattr(request, 'vendor', None) or getattr(request, 'user', None)
+    pincodes = []
+    try:
+        if getattr(vendor, 'serviceable_locations', None) is not None:
+            pincodes = list(
+                vendor.serviceable_locations.filter(is_active=True).values_list('pincode', flat=True)
+            )
+    except Exception:
+        pincodes = []
+
+    if not pincodes:
+        pincode = (getattr(vendor, 'pincode', '') or '').strip()
+        if pincode:
+            pincodes = [pincode]
+
     categories = Category.objects.all().order_by('position')
+    if pincodes:
+        categories = categories.filter(
+            location_availability__location__pincode__in=pincodes,
+            location_availability__location__is_active=True,
+            location_availability__is_available=True,
+        ).distinct().order_by('position')
+
     serializer = CategorySerializer(categories, many=True)
 
     return Response({
@@ -9859,6 +11028,487 @@ def vendor_dashboard(request):
             'success': False,
             'message': f'Failed to load dashboard: {str(e)}'
         }, status=500)
+
+
+# =============================================================================
+# VENDOR: TRIAL BOOKINGS (Vendor accepts/rejects)
+# =============================================================================
+
+@api_view(['GET'])
+@authentication_classes([VendorTokenAuthentication])
+@permission_classes([IsAuthenticatedVendor])
+def vendor_trial_bookings(request):
+    """
+    Vendor trial requests list.
+    Query params:
+      - decision: pending|accepted|rejected (default: pending)
+    """
+    vendor = request.user
+    decision = (request.GET.get('decision') or 'pending').strip().lower()
+    if decision not in ['pending', 'accepted', 'rejected']:
+        decision = 'pending'
+
+    from backend.models import TrialBooking
+
+    qs = TrialBooking.objects.filter(
+        vendor=vendor,
+        vendor_decision=decision,
+    ).select_related('user').prefetch_related('items__dress__product')
+
+    data = []
+    for t in qs.order_by('-created_at')[:200]:
+        items = []
+        for it in t.items.all():
+            opt = it.dress
+            prod = getattr(opt, 'product', None)
+            items.append({
+                'product_option_id': str(opt.id),
+                'title': str(opt),
+                'product_id': str(prod.id) if prod else None,
+                'product_title': getattr(prod, 'title', None),
+            })
+
+        data.append({
+            'id': str(t.id),
+            'trial_date': t.trial_date.strftime('%Y-%m-%d'),
+            'time_slot': t.time_slot,
+            'address': t.address,
+            'area': t.area,
+            'trial_fee': int(t.trial_fee or 0),
+            'payment_status': t.payment_status,
+            'status': t.status,
+            'vendor_decision': t.vendor_decision,
+            'vendor_message': t.vendor_message or '',
+            'created_at': t.created_at.isoformat(),
+            'customer': {
+                'id': t.user_id,
+                'fullname': t.user.fullname,
+                'phone': t.user.phone,
+                'email': t.user.email,
+            },
+            'items': items,
+            'items_count': len(items),
+        })
+
+    pending_count = TrialBooking.objects.filter(vendor=vendor, vendor_decision='pending').count()
+
+    return Response({
+        'success': True,
+        'trial_bookings': data,
+        'pending_count': pending_count,
+        'decision': decision,
+        'total': len(data),
+    })
+
+
+@api_view(['POST'])
+@authentication_classes([VendorTokenAuthentication])
+@permission_classes([IsAuthenticatedVendor])
+def vendor_trial_decide(request, trial_id):
+    """
+    Vendor accepts/rejects a trial booking.
+    Body:
+      - decision: accepted|rejected
+      - message: optional text
+    """
+    vendor = request.user
+    decision = (request.data.get('decision') or '').strip().lower()
+    message = (request.data.get('message') or '').strip()
+
+    if decision not in ['accepted', 'rejected']:
+        return Response({'success': False, 'message': 'Invalid decision'}, status=400)
+
+    from backend.models import TrialBooking
+    try:
+        with transaction.atomic():
+            trial = TrialBooking.objects.select_for_update().select_related('user').get(id=trial_id, vendor=vendor)
+
+            if trial.vendor_decision != TrialBooking.DECISION_PENDING:
+                return Response({
+                    'success': False,
+                    'message': f'Trial already {trial.vendor_decision}',
+                }, status=400)
+
+            trial.vendor_decision = decision
+            trial.vendor_message = message
+            trial.vendor_decided_at = timezone.now()
+
+            # Map vendor decision to fulfillment status for existing UI
+            if decision == 'accepted':
+                trial.status = TrialBooking.STATUS_APPROVED
+            else:
+                trial.status = TrialBooking.STATUS_CANCELLED
+
+            trial.save(update_fields=['vendor_decision', 'vendor_message', 'vendor_decided_at', 'status', 'updated_at'])
+
+    except TrialBooking.DoesNotExist:
+        return Response({'success': False, 'message': 'Trial booking not found'}, status=404)
+
+    # Notify customer
+    customer = trial.user
+    if decision == 'accepted':
+        title = 'Trial request accepted'
+        body = (
+            f'Your trial request is accepted by vendor. '
+            f'Please be available on {trial.trial_date.strftime("%d %b %Y")} at {trial.time_slot} '
+            f'at your address.'
+        )
+    else:
+        title = 'Trial request rejected'
+        body = 'Your trial request was rejected by vendor.'
+        if message:
+            body = f'{body} Reason: {message}'
+
+    _notify_user_trial_decision(
+        customer,
+        title,
+        body,
+        data={'screen': 'trial', 'type': 'trial_vendor_decision', 'trial_id': str(trial.id), 'decision': decision},
+    )
+
+    return Response({'success': True, 'message': f'Trial {decision}', 'trial_id': str(trial.id), 'decision': decision})
+
+
+# =============================================================================
+# SERVICE VENDOR (Services mode) - OTP auth + Service management
+# =============================================================================
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def service_vendor_request_otp(request):
+    phone = (request.data.get('phone') or '').strip()
+    if not phone:
+        return Response({'success': False, 'message': 'phone is required'}, status=400)
+    return send_otp(phone)
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def service_vendor_verify_otp(request):
+    phone = (request.data.get('phone') or '').strip()
+    otp = request.data.get('otp')
+    if not phone or not otp:
+        return Response({'success': False, 'message': 'phone and otp are required'}, status=400)
+
+    otp_obj = get_object_or_404(Otp, phone=phone, verified=False)
+    if otp_obj.validity.replace(tzinfo=None) <= datetime.datetime.utcnow():
+        return Response({'success': False, 'message': 'otp expired'}, status=400)
+
+    try:
+        if otp_obj.otp != int(otp):
+            return Response({'success': False, 'message': 'Incorrect otp'}, status=400)
+    except Exception:
+        return Response({'success': False, 'message': 'Invalid otp'}, status=400)
+
+    otp_obj.verified = True
+    otp_obj.save()
+    return Response({'success': True, 'message': 'otp_verified_successfully'})
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def service_vendor_signup(request):
+    """
+    Create (or log in) a ServiceVendor after OTP verification.
+    """
+    name = (request.data.get('name') or '').strip()
+    area = (request.data.get('area') or '').strip()
+    pincode = (request.data.get('pincode') or '').strip()
+    phone = (request.data.get('phone') or '').strip()
+    otp = request.data.get('otp')
+    fcmtoken = (request.data.get('fcmtoken') or request.data.get('fcm_token') or '').strip()
+    subcategory_ids = request.data.get('service_subcategory_ids') or request.data.get('service_subcategories') or []
+
+    if not all([name, phone, otp]):
+        return Response({'success': False, 'message': 'name, phone and otp are required'}, status=400)
+
+    verified_otp = Otp.objects.filter(phone=phone, verified=True).order_by('-id').first()
+    if not verified_otp:
+        return Response({'success': False, 'message': 'OTP not verified'}, status=400)
+
+    vendor, _created = ServiceVendor.objects.get_or_create(
+        phone=phone,
+        defaults={'name': name, 'area': area, 'pincode': pincode},
+    )
+
+    if not vendor.is_active:
+        return Response({'success': False, 'message': 'Account is deactivated. Contact administrator.'}, status=403)
+
+    # Update basic profile fields
+    updates = {}
+    if name and vendor.name != name:
+        updates['name'] = name
+    if area and vendor.area != area:
+        updates['area'] = area
+    if pincode and vendor.pincode != pincode:
+        updates['pincode'] = pincode
+    if updates:
+        ServiceVendor.objects.filter(pk=vendor.pk).update(**updates)
+        vendor.refresh_from_db()
+
+    # Attach allowed subcategories
+    if isinstance(subcategory_ids, str):
+        subcategory_ids = [s.strip() for s in subcategory_ids.split(',') if s.strip()]
+    if isinstance(subcategory_ids, list) and subcategory_ids:
+        qs = ServiceSubCategory.objects.filter(id__in=subcategory_ids)
+        vendor.service_subcategories.set(qs)
+
+    token = uuid.uuid4().hex
+    ServiceVendorToken.objects.create(token=token, vendor=vendor, fcmtoken=fcmtoken)
+
+    return Response({
+        'success': True,
+        'message': 'Signup successful',
+        'token': token,
+        'vendor': {
+            'id': str(vendor.id),
+            'service_vendor_id': vendor.service_vendor_id,
+            'name': vendor.name,
+            'phone': vendor.phone,
+            'area': vendor.area,
+            'pincode': vendor.pincode,
+            'service_subcategories': list(vendor.service_subcategories.values('id', 'name')),
+        }
+    })
+
+
+@api_view(['POST'])
+@authentication_classes([ServiceVendorTokenAuthentication])
+@permission_classes([IsAuthenticatedServiceVendor])
+def service_vendor_logout(request):
+    token = request.headers.get('Authorization')
+    if token:
+        try:
+            token_parts = str(token).split()
+            if len(token_parts) == 2:
+                token_value = token_parts[1]
+                ServiceVendorToken.objects.filter(token=token_value).delete()
+                return Response({'success': True, 'message': 'Logged out successfully'})
+        except Exception:
+            pass
+    return Response({'success': False, 'message': 'Logout failed'}, status=400)
+
+
+@api_view(['GET'])
+@authentication_classes([ServiceVendorTokenAuthentication])
+@permission_classes([IsAuthenticatedServiceVendor])
+def service_vendor_my_services(request):
+    vendor = request.user
+    services = Service.objects.filter(service_vendor=vendor).order_by('-created_at')
+    data = ServiceSerializer(services, many=True, context={'request': request}).data
+    return Response({'success': True, 'services': data})
+
+
+@api_view(['POST'])
+@authentication_classes([ServiceVendorTokenAuthentication])
+@permission_classes([IsAuthenticatedServiceVendor])
+def service_vendor_create_service(request):
+    vendor = request.user
+
+    title = (request.data.get('title') or '').strip()
+    description = (request.data.get('description') or '').strip()
+    base_price = int(request.data.get('base_price') or 0)
+    category_id = request.data.get('category_id')
+    subcategory_id = request.data.get('subcategory_id')
+    location = (request.data.get('location') or vendor.area or '').strip()
+    languages = (request.data.get('languages') or 'Hindi, English').strip()
+
+    if not title or not description:
+        return Response({'success': False, 'message': 'title and description are required'}, status=400)
+
+    category = ServiceCategory.objects.filter(id=category_id).first() if category_id else None
+    subcategory = ServiceSubCategory.objects.filter(id=subcategory_id).first() if subcategory_id else None
+
+    service = Service.objects.create(
+        title=title,
+        description=description,
+        base_price=base_price,
+        category=category or (subcategory.category if subcategory else None),
+        subcategory=subcategory,
+        location=location,
+        provider_name=vendor.name,
+        provider_phone=vendor.phone,
+        provider_email='',
+        languages=languages,
+        service_vendor=vendor,
+    )
+
+    return Response({
+        'success': True,
+        'message': 'Service created',
+        'service': ServiceSerializer(service, context={'request': request}).data
+    }, status=201)
+
+
+@api_view(['PUT'])
+@authentication_classes([ServiceVendorTokenAuthentication])
+@permission_classes([IsAuthenticatedServiceVendor])
+def service_vendor_update_service(request, service_id):
+    vendor = request.user
+    service = get_object_or_404(Service, id=service_id, service_vendor=vendor)
+
+    for field in ['title', 'description', 'location', 'languages']:
+        if field in request.data and request.data.get(field) is not None:
+            setattr(service, field, str(request.data.get(field)).strip())
+
+    if 'base_price' in request.data:
+        try:
+            service.base_price = int(request.data.get('base_price') or 0)
+        except Exception:
+            return Response({'success': False, 'message': 'Invalid base_price'}, status=400)
+
+    if 'subcategory_id' in request.data:
+        subcategory_id = request.data.get('subcategory_id')
+        service.subcategory = ServiceSubCategory.objects.filter(id=subcategory_id).first() if subcategory_id else None
+
+    if 'category_id' in request.data:
+        category_id = request.data.get('category_id')
+        service.category = ServiceCategory.objects.filter(id=category_id).first() if category_id else None
+
+    service.provider_name = vendor.name
+    service.provider_phone = vendor.phone
+    service.save()
+
+    return Response({
+        'success': True,
+        'message': 'Service updated',
+        'service': ServiceSerializer(service, context={'request': request}).data
+    })
+
+
+@api_view(['DELETE'])
+@authentication_classes([ServiceVendorTokenAuthentication])
+@permission_classes([IsAuthenticatedServiceVendor])
+def service_vendor_delete_service(request, service_id):
+    vendor = request.user
+    service = get_object_or_404(Service, id=service_id, service_vendor=vendor)
+    service.delete()
+    return Response({'success': True, 'message': 'Service deleted'})
+
+
+@api_view(['GET'])
+@authentication_classes([ServiceVendorTokenAuthentication])
+@permission_classes([IsAuthenticatedServiceVendor])
+def service_vendor_dashboard(request):
+    """
+    Basic dashboard stats for service vendors.
+    """
+    vendor = request.user
+
+    services_qs = Service.objects.filter(service_vendor=vendor)
+    bookings_qs = ServiceBooking.objects.filter(service_option__service__service_vendor=vendor)
+
+    total_services = services_qs.count()
+    total_bookings = bookings_qs.count()
+    pending_bookings = bookings_qs.filter(status='PENDING').count()
+    confirmed_bookings = bookings_qs.filter(status='CONFIRMED').count()
+
+    total_revenue = bookings_qs.filter(payment_status='PAID').aggregate(total=Sum('total_amount'))['total'] or 0
+
+    return Response({
+        'success': True,
+        'dashboard': {
+            'vendor_info': {
+                'service_vendor_id': vendor.service_vendor_id,
+                'name': vendor.name,
+                'phone': vendor.phone,
+                'area': vendor.area,
+                'pincode': vendor.pincode,
+            },
+            'total_services': total_services,
+            'total_bookings': total_bookings,
+            'pending_bookings': pending_bookings,
+            'confirmed_bookings': confirmed_bookings,
+            'total_revenue': int(total_revenue),
+        }
+    })
+
+
+@api_view(['GET'])
+@authentication_classes([ServiceVendorTokenAuthentication])
+@permission_classes([IsAuthenticatedServiceVendor])
+def service_vendor_bookings(request):
+    """
+    List bookings for a service vendor.
+    GET /api/service-vendor/bookings/?status=PENDING&page=1&search=...
+    """
+    vendor = request.user
+
+    bookings = ServiceBooking.objects.filter(
+        service_option__service__service_vendor=vendor
+    ).select_related(
+        'service_option',
+        'service_option__service',
+        'user',
+    ).order_by('-created_at')
+
+    status_filter = (request.GET.get('status') or '').strip().upper()
+    if status_filter and status_filter != 'ALL':
+        bookings = bookings.filter(status=status_filter)
+
+    search = (request.GET.get('search') or '').strip()
+    if search:
+        bookings = bookings.filter(
+            Q(customer_name__icontains=search) |
+            Q(customer_phone__icontains=search) |
+            Q(customer_address__icontains=search) |
+            Q(id__icontains=search) |
+            Q(service_option__service__title__icontains=search) |
+            Q(service_option__option_name__icontains=search)
+        )
+
+    page = int(request.GET.get('page', 1))
+    page_size = 20
+    start = (page - 1) * page_size
+    end = start + page_size
+
+    total_count = bookings.count()
+    total_pages = (total_count + page_size - 1) // page_size
+
+    page_items = bookings[start:end]
+    data = ServiceBookingSerializer(page_items, many=True, context={'request': request}).data
+
+    return Response({
+        'success': True,
+        'bookings': data,
+        'pagination': {
+            'page': page,
+            'page_size': page_size,
+            'total_count': total_count,
+            'total_pages': total_pages,
+            'has_next': page < total_pages,
+        }
+    })
+
+
+@api_view(['POST'])
+@authentication_classes([ServiceVendorTokenAuthentication])
+@permission_classes([IsAuthenticatedServiceVendor])
+def service_vendor_confirm_booking(request, booking_id):
+    vendor = request.user
+    booking = get_object_or_404(
+        ServiceBooking,
+        id=booking_id,
+        service_option__service__service_vendor=vendor
+    )
+    booking.status = 'CONFIRMED'
+    booking.save(update_fields=['status', 'updated_at'])
+    return Response({'success': True, 'message': 'Booking confirmed'})
+
+
+@api_view(['POST'])
+@authentication_classes([ServiceVendorTokenAuthentication])
+@permission_classes([IsAuthenticatedServiceVendor])
+def service_vendor_cancel_booking(request, booking_id):
+    vendor = request.user
+    booking = get_object_or_404(
+        ServiceBooking,
+        id=booking_id,
+        service_option__service__service_vendor=vendor
+    )
+    booking.status = 'CANCELLED'
+    booking.save(update_fields=['status', 'updated_at'])
+    return Response({'success': True, 'message': 'Booking cancelled'})
 
 
 @api_view(['GET'])

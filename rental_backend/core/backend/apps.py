@@ -15,6 +15,6 @@ class BackendConfig(AppConfig):
                     firebase_admin.get_app()
                 except ValueError:
                     firebase_admin.initialize_app(creds)
-                    print('✅ Firebase Admin initialized for FCM push')
+                    print('Firebase Admin initialized for FCM push')
         except Exception as e:
-            print(f'⚠️ Firebase Admin init (optional): {e}')
+            print(f'Firebase Admin init (optional): {e}')

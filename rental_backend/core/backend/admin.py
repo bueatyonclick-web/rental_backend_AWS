@@ -1,4 +1,5 @@
 import schedule as schedule
+import json
 from django.contrib import admin, messages
 from django.contrib.admin import register
 from django.contrib.auth.hashers import make_password
@@ -10,6 +11,9 @@ from django.shortcuts import render, redirect
 from django.contrib.admin.views.decorators import staff_member_required
 from django.http import HttpResponseRedirect
 from datetime import datetime, timedelta
+from django.utils import timezone
+from django.db.models import Count, Sum, Avg
+from django.db.models.functions import TruncDate
 
 from django import forms
 
@@ -17,8 +21,8 @@ from backend.models import User, Otp, Token, PasswordResetToken, Category, Slide
     PageItem, Order, OrderedProduct, Notification, ContactInfo, InformMe, AppVersion, ServiceOption, \
     ServiceCategory, ServiceSubCategory, Service, ServiceImage, ServiceBooking, ServicePageItem, Vendor, VendorToken, CartItem, \
     ProductBooking, UserAddress, ServiceCategoryAvailability, PageItemAvailability, ServiceableLocation, \
-    CategoryAvailability, HomePageItem, UserDevice, AdminNotificationLog, ArtistAvailability
-from .models import User
+    CategoryAvailability, HomePageItem, UserDevice, AdminNotificationLog, ArtistAvailability, Coupon, CouponUsage, \
+    ReferralSettings, Referral, WalletTransaction, ServiceVendor, ServiceVendorToken, TrialSettings, TrialBooking, TrialItem, ScreenViewEvent, CustomerLocationPing
 
 admin.site.unregister(Group)
 admin.site.unregister(AUser)
@@ -27,10 +31,270 @@ admin.site.site_header = "rental Cloths Admin"
 admin.site.site_title = "rental-Cloths  Admin"
 admin.site.index_title = "Welcome to rental Cloths  Admin Panel"
 
+@admin.register(ScreenViewEvent)
+class ScreenViewEventAdmin(admin.ModelAdmin):
+    change_list_template = 'admin/backend/screenviewevent/change_list.html'
+    list_display = ['screen', 'user_link', 'device_id', 'session_id', 'duration_seconds', 'started_at', 'ended_at']
+    list_filter = ['screen', 'platform', 'app_version']
+    search_fields = ['screen', 'user__email', 'user__phone', 'device_id', 'session_id']
+    readonly_fields = ['id', 'started_at', 'ended_at', 'duration_seconds']
+    date_hierarchy = 'started_at'
+    ordering = ['-started_at']
+
+    def get_urls(self):
+        urls = super().get_urls()
+        custom_urls = [
+            path(
+                'user/<int:user_id>/',
+                self.admin_site.admin_view(self.user_timeline_view),
+                name='backend_screen_user_timeline',
+            ),
+            path(
+                'screen-analytics/',
+                self.admin_site.admin_view(self.screen_analytics_view),
+                name='backend_screen_analytics',
+            ),
+            path(
+                'app-opens/',
+                self.admin_site.admin_view(self.app_opens_view),
+                name='backend_app_opens',
+            ),
+            path(
+                'dashboard/',
+                self.admin_site.admin_view(self.analytics_dashboard_view),
+                name='backend_analytics_dashboard',
+            ),
+        ]
+        return custom_urls + urls
+
+    def user_link(self, obj):
+        """
+        Clickable user → shows per-user screen timeline.
+        If user is NULL, show device_id (guest/unauthenticated analytics call).
+        """
+        if getattr(obj, 'user_id', None):
+            try:
+                url = reverse('admin:backend_screen_user_timeline', args=[obj.user_id])
+                label = getattr(obj.user, 'fullname', '') or getattr(obj.user, 'email', '') or f'User {obj.user_id}'
+                return format_html('<a href="{}">{}</a>', url, label)
+            except Exception:
+                return obj.user
+        return obj.device_id or '-'
+    user_link.short_description = 'User'
+    user_link.admin_order_field = 'user'
+
+    def user_timeline_view(self, request, user_id: int):
+        """
+        User-wise screen list with durations.
+        """
+        qs = (
+            ScreenViewEvent.objects
+            .select_related('user')
+            .filter(user_id=user_id)
+            .order_by('-started_at')
+        )
+        user = User.objects.filter(id=user_id).first()
+
+        # Per-screen totals for this user
+        screen_totals = (
+            qs.values('screen')
+            .annotate(opens=Count('id'), total_seconds=Sum('duration_seconds'), avg_seconds=Avg('duration_seconds'))
+            .order_by('-opens')
+        )
+        overall = qs.aggregate(opens=Count('id'), total_seconds=Sum('duration_seconds'))
+
+        context = {
+            'title': 'User screen analytics',
+            'user_obj': user,
+            'events': qs[:500],  # keep page fast; can add pagination later
+            'screen_totals': screen_totals,
+            'overall_opens': int(overall.get('opens') or 0),
+            'overall_total_seconds': int(overall.get('total_seconds') or 0),
+        }
+        return render(request, 'admin/user_screen_timeline.html', context=context)
+
+    def screen_analytics_view(self, request):
+        """
+        Simple per-screen aggregates for admin analysis.
+        """
+        qs = ScreenViewEvent.objects.all()
+        rows = (
+            qs.values('screen')
+            .annotate(
+                opens=Count('id'),
+                unique_users=Count('user', distinct=True),
+                total_seconds=Sum('duration_seconds'),
+                avg_seconds=Avg('duration_seconds'),
+            )
+            .order_by('-opens')
+        )
+        return render(
+            request,
+            'admin/screen_analytics.html',
+            context={'rows': rows},
+        )
+
+    def app_opens_view(self, request):
+        """
+        Daily app opens summary (based on ScreenViewEvent where screen='app_open').
+        """
+        qs = ScreenViewEvent.objects.filter(screen='app_open')
+        rows = (
+            qs.extra(select={'day': "date(started_at)"})
+            .values('day')
+            .annotate(
+                opens=Count('id'),
+                unique_users=Count('user', distinct=True),
+                total_seconds=Sum('duration_seconds'),
+            )
+            .order_by('-day')
+        )
+        return render(
+            request,
+            'admin/app_opens_analytics.html',
+            context={'rows': rows},
+        )
+
+    def analytics_dashboard_view(self, request):
+        """
+        Pretty analytics dashboard with charts for:
+          - App opens over time
+          - Screen opens + time spent
+          - Orders over time + status breakdown
+          - Users by city (based on pincode -> ServiceableLocation)
+        """
+        # Date range (default last 14 days)
+        try:
+            days = int(request.GET.get('days') or 14)
+        except (TypeError, ValueError):
+            days = 14
+        days = max(1, min(days, 120))
+
+        end_dt = timezone.now()
+        start_dt = end_dt - timedelta(days=days)
+
+        # ---- Screen analytics ----
+        base_qs = ScreenViewEvent.objects.filter(started_at__gte=start_dt, started_at__lte=end_dt)
+        app_open_qs = base_qs.filter(screen='app_open')
+        screen_qs = base_qs.exclude(screen='app_open')
+
+        app_opens_series = (
+            app_open_qs.annotate(day=TruncDate('started_at'))
+            .values('day')
+            .annotate(opens=Count('id'))
+            .order_by('day')
+        )
+
+        top_screens = (
+            screen_qs.values('screen')
+            .annotate(opens=Count('id'), total_seconds=Sum('duration_seconds'), avg_seconds=Avg('duration_seconds'))
+            .order_by('-opens')[:12]
+        )
+
+        # ---- Orders analytics ----
+        orders_qs = Order.objects.filter(created_at__gte=start_dt, created_at__lte=end_dt)
+        orders_series = (
+            orders_qs.annotate(day=TruncDate('created_at'))
+            .values('day')
+            .annotate(orders=Count('id'))
+            .order_by('day')
+        )
+        orders_status = (
+            orders_qs.values('tx_status')
+            .annotate(count=Count('id'))
+            .order_by('-count')[:10]
+        )
+
+        # ---- City analytics (by pincode) ----
+        # Map pincode -> city name from ServiceableLocation
+        loc_map = {str(l.pincode): (l.city or l.area_name or str(l.pincode)) for l in ServiceableLocation.objects.all()}
+
+        users_by_city_counts = {}
+        # NOTE: User.pincode is an IntegerField in current schema, but some legacy DBs may contain ''.
+        # Avoid pincode='' filters (they crash with "expected a number but got ''").
+        for u in User.objects.exclude(pincode__isnull=True).only('pincode'):
+            pc_raw = getattr(u, 'pincode', None)
+            if pc_raw is None:
+                continue
+            try:
+                pc = str(int(pc_raw))
+            except (TypeError, ValueError):
+                continue
+            city = loc_map.get(pc, pc)
+            users_by_city_counts[city] = users_by_city_counts.get(city, 0) + 1
+        users_by_city = sorted(
+            [{'city': k, 'count': v} for k, v in users_by_city_counts.items()],
+            key=lambda x: x['count'],
+            reverse=True,
+        )[:12]
+
+        # Orders by city (from order.user.pincode)
+        orders_by_city_counts = {}
+        for o in orders_qs.select_related('user').only('user__pincode'):
+            pc_raw = getattr(o.user, 'pincode', None) if getattr(o, 'user', None) else None
+            if pc_raw is None:
+                continue
+            try:
+                pc = str(int(pc_raw))
+            except (TypeError, ValueError):
+                continue
+            city = loc_map.get(pc, pc)
+            orders_by_city_counts[city] = orders_by_city_counts.get(city, 0) + 1
+        orders_by_city = sorted(
+            [{'city': k, 'count': v} for k, v in orders_by_city_counts.items()],
+            key=lambda x: x['count'],
+            reverse=True,
+        )[:12]
+
+        context = {
+            'days': days,
+            'start_dt': start_dt,
+            'end_dt': end_dt,
+            # JSON payloads for Chart.js
+            'app_opens_series_json': json.dumps([
+                {'day': str(r['day']), 'opens': int(r['opens'] or 0)} for r in app_opens_series
+            ]),
+            'top_screens_json': json.dumps([
+                {
+                    'screen': r['screen'],
+                    'opens': int(r['opens'] or 0),
+                    'total_seconds': int(r['total_seconds'] or 0),
+                    'avg_seconds': float(r['avg_seconds'] or 0),
+                }
+                for r in top_screens
+            ]),
+            'orders_series_json': json.dumps([
+                {'day': str(r['day']), 'orders': int(r['orders'] or 0)} for r in orders_series
+            ]),
+            'orders_status_json': json.dumps([
+                {'status': (r['tx_status'] or 'UNKNOWN'), 'count': int(r['count'] or 0)} for r in orders_status
+            ]),
+            'users_by_city_json': json.dumps(users_by_city),
+            'orders_by_city_json': json.dumps(orders_by_city),
+        }
+        return render(request, 'admin/analytics_dashboard.html', context=context)
+
+
+@admin.register(CustomerLocationPing)
+class CustomerLocationPingAdmin(admin.ModelAdmin):
+    list_display = ['created_at', 'user', 'device_id', 'latitude', 'longitude', 'accuracy_m', 'map_link']
+    list_filter = ['platform']
+    search_fields = ['device_id', 'user__email', 'user__phone']
+    date_hierarchy = 'created_at'
+    ordering = ['-created_at']
+
+    def map_link(self, obj):
+        try:
+            url = f"https://maps.google.com/?q={obj.latitude},{obj.longitude}"
+            return format_html('<a href="{}" target="_blank">Open</a>', url)
+        except Exception:
+            return "-"
+    map_link.short_description = "Map"
+
 
 @register(User)
 class UserAdmin(admin.ModelAdmin):
-    list_display = ['id', 'email', 'phone', 'fullname', 'address', 'pincode', 'created_at']
+    list_display = ['id', 'email', 'phone', 'fullname', 'referral_code', 'referral_wallet_balance', 'referred_by', 'is_banned', 'created_at']
     fieldsets = (
         ('User info', {
             'fields': ('email', 'phone', 'fullname', 'password',)
@@ -38,8 +302,34 @@ class UserAdmin(admin.ModelAdmin):
         ('Address info', {
             'fields': ('name', 'address', 'contact_no', 'pincode', 'district', 'state',)
         }),
+        ('Referral & Fraud', {
+            'fields': (
+                'referral_code',
+                'referred_by',
+                'referral_wallet_balance',
+                'device_id',
+                'signup_ip',
+                'is_banned',
+                'ban_reason',
+            )
+        }),
     )
-    readonly_fields = ['password', 'email','phone','fullname','name','address','pincode','district', 'state','contact_no']
+    readonly_fields = [
+        'password',
+        'email',
+        'phone',
+        'fullname',
+        'name',
+        'address',
+        'pincode',
+        'district',
+        'state',
+        'contact_no',
+        'referral_code',
+        'referred_by',
+        'device_id',
+        'signup_ip',
+    ]
     search_fields = ['id','email','phone','fullname','address','pincode']
     search_help_text =  "Search by id,email,phone,fullname,address,pincode"
 
@@ -68,11 +358,58 @@ class PasswordResetTokenAdmin(admin.ModelAdmin):
         return False
 
 
+class CategoryAdminForm(forms.ModelForm):
+    """
+    Admin UX: pick which ServiceableLocation(s) this category is available in.
+    Stored in CategoryAvailability (category + location + is_available).
+    If no locations are selected, the category is treated as available everywhere (backward compatible).
+    """
+    available_locations = forms.ModelMultipleChoiceField(
+        queryset=ServiceableLocation.objects.filter(is_active=True).order_by('city', 'area_name', 'pincode'),
+        required=False,
+        widget=forms.SelectMultiple(attrs={'size': 12}),
+        help_text='Select locations where this category should be visible for vendors/products.',
+    )
+
+    class Meta:
+        model = Category
+        fields = '__all__'
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.instance and getattr(self.instance, 'pk', None):
+            loc_ids = list(
+                CategoryAvailability.objects.filter(
+                    category=self.instance,
+                    is_available=True,
+                    location__is_active=True,
+                ).values_list('location_id', flat=True)
+            )
+            self.fields['available_locations'].initial = ServiceableLocation.objects.filter(id__in=loc_ids)
+
+    def save(self, commit=True):
+        # Admin always calls save(commit=False) first, then obj.save() in save_model.
+        # Filtering CategoryAvailability by an unsaved category raises ValueError.
+        return super().save(commit=commit)
+
+
 @register(Category)
 class CategoryAdmin(admin.ModelAdmin):
+    form = CategoryAdminForm
     list_display = ['id', 'name', 'gender', 'position', 'image']
     list_filter = ['gender']
     search_fields = ['name']
+
+    def save_model(self, request, obj, form, change):
+        super().save_model(request, obj, form, change)
+        if not isinstance(form, CategoryAdminForm):
+            return
+        selected_locations = list(form.cleaned_data.get('available_locations') or [])
+        CategoryAvailability.objects.filter(category=obj).delete()
+        CategoryAvailability.objects.bulk_create([
+            CategoryAvailability(category=obj, location=loc, is_available=True)
+            for loc in selected_locations
+        ])
 
 
 
@@ -137,13 +474,325 @@ class ProductOptionInline(admin.TabularInline):
         return formset
 
 
+@register(ReferralSettings)
+class ReferralSettingsAdmin(admin.ModelAdmin):
+    list_display = [
+        'id',
+        'referral_reward_amount',
+        'minimum_order_amount',
+        'max_wallet_usage_percent',
+        'reward_hold_days',
+        'max_referrals_per_day',
+        'created_at',
+    ]
+    readonly_fields = ['created_at', 'updated_at']
+
+
+class TrialItemInline(admin.TabularInline):
+    model = TrialItem
+    fields = ['dress']
+    extra = 0
+
+
+class TrialSettingsAdminForm(forms.ModelForm):
+    """
+    Better admin UX:
+    - Select enabled trial areas from existing ServiceableLocation rows
+    - Enter human-friendly slots like "12 PM - 2 PM"
+    Values are stored into JSON fields TrialSettings.trial_enabled_areas and TrialSettings.trial_slots.
+    """
+    enabled_locations = forms.ModelMultipleChoiceField(
+        queryset=ServiceableLocation.objects.all().order_by('pincode'),
+        required=False,
+        widget=forms.SelectMultiple(attrs={'size': 12}),
+        help_text='Select serviceable locations where trial is enabled.',
+    )
+    slots_input = forms.CharField(
+        required=False,
+        widget=forms.Textarea(attrs={'rows': 4, 'placeholder': 'e.g.\n10 AM - 12 PM\n12 PM - 2 PM\n6 PM - 10 PM'}),
+        help_text='Enter one slot per line (stored as array).',
+    )
+
+    class Meta:
+        model = TrialSettings
+        fields = ['trial_fee', 'max_trial_items', 'trial_discount_enabled', 'trial_enabled_areas', 'trial_slots']
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # Pre-fill enabled_locations from stored area strings (match by pincode/area_name)
+        stored_areas = list(getattr(self.instance, 'trial_enabled_areas', []) or [])
+        if stored_areas:
+            qs = ServiceableLocation.objects.none()
+            try:
+                qs = ServiceableLocation.objects.filter(area_name__in=stored_areas)
+            except Exception:
+                qs = ServiceableLocation.objects.none()
+            self.fields['enabled_locations'].initial = qs
+
+        # Pre-fill slots_input from stored slots list
+        stored_slots = list(getattr(self.instance, 'trial_slots', []) or [])
+        if stored_slots:
+            self.fields['slots_input'].initial = "\n".join([str(s) for s in stored_slots if str(s).strip()])
+
+        # Hide raw JSON fields from admin form (we use nicer inputs)
+        self.fields['trial_enabled_areas'].widget = forms.HiddenInput()
+        self.fields['trial_slots'].widget = forms.HiddenInput()
+
+    def clean(self):
+        cleaned = super().clean()
+
+        # Locations → store area_name strings
+        locations = cleaned.get('enabled_locations') or []
+        enabled_areas = [str(loc.area_name) for loc in locations if getattr(loc, 'area_name', None)]
+        cleaned['trial_enabled_areas'] = enabled_areas
+
+        # Slots input (one per line) → array of strings
+        slots_raw = (cleaned.get('slots_input') or '').strip()
+        slots = []
+        if slots_raw:
+            for line in slots_raw.splitlines():
+                s = line.strip()
+                if s:
+                    slots.append(s)
+        cleaned['trial_slots'] = slots
+
+        return cleaned
+
+
+@register(TrialSettings)
+class TrialSettingsAdmin(admin.ModelAdmin):
+    form = TrialSettingsAdminForm
+    list_display = [
+        'id',
+        'trial_fee',
+        'max_trial_items',
+        'trial_discount_enabled',
+        'created_at',
+    ]
+    readonly_fields = ['created_at', 'updated_at']
+
+    fieldsets = (
+        (None, {
+            'fields': ('trial_fee', 'max_trial_items', 'trial_discount_enabled')
+        }),
+        ('Enabled Areas', {
+            'fields': ('enabled_locations',),
+        }),
+        ('Trial Slots', {
+            'fields': ('slots_input',),
+        }),
+        ('(Stored JSON)', {
+            'fields': ('trial_enabled_areas', 'trial_slots'),
+            'classes': ('collapse',),
+        }),
+        ('Timestamps', {
+            'fields': ('created_at', 'updated_at'),
+            'classes': ('collapse',),
+        }),
+    )
+
+
+@register(TrialBooking)
+class TrialBookingAdmin(admin.ModelAdmin):
+    inlines = [TrialItemInline]
+    list_display = [
+        'id',
+        'user',
+        'area',
+        'trial_date',
+        'time_slot',
+        'trial_fee',
+        'payment_status',
+        'status',
+        'converted_order',
+        'created_at',
+    ]
+    list_filter = ['payment_status', 'status', 'trial_date', 'created_at']
+    search_fields = ['id', 'user__email', 'user__phone', 'area', 'address']
+    autocomplete_fields = ['user', 'converted_order']
+    readonly_fields = ['created_at', 'updated_at', 'converted_at']
+
+
+@register(Referral)
+class ReferralAdmin(admin.ModelAdmin):
+    list_display = [
+        'id',
+        'referrer',
+        'referred_user',
+        'referral_code',
+        'reward_amount',
+        'status',
+        'is_suspicious',
+        'created_at',
+    ]
+    list_filter = ['status', 'is_suspicious', 'created_at']
+    search_fields = ['referrer__email', 'referred_user__email', 'referral_code']
+    autocomplete_fields = ['referrer', 'referred_user']
+    actions = ['mark_as_suspicious', 'approve_and_credit', 'credit_missing_wallet_repair', 'reject_referrals']
+
+    def mark_as_suspicious(self, request, queryset):
+        updated = queryset.update(is_suspicious=True)
+        self.message_user(request, f"Marked {updated} referrals as suspicious.", level=messages.WARNING)
+
+    mark_as_suspicious.short_description = "Mark selected referrals as suspicious"
+
+    def approve_and_credit(self, request, queryset):
+        """
+        Admin fraud dashboard action:
+        - Only credits wallet for non-suspicious, non-rewarded referrals.
+        """
+        credited = 0
+        skipped_hold = 0
+        for referral in queryset.select_related('referrer', 'referred_user'):
+            # Skip suspicious, already rewarded, or not yet completed
+            if referral.is_suspicious or referral.status == Referral.STATUS_REWARDED:
+                continue
+            if referral.status != Referral.STATUS_COMPLETED:
+                continue
+
+            referrer = referral.referrer
+            if not referrer or referrer.is_banned:
+                continue
+
+            # Enforce hold period: do not credit before hold_until
+            if referral.hold_until and referral.hold_until > timezone.now():
+                skipped_hold += 1
+                continue
+
+            amount = referral.reward_amount
+            if not amount or amount <= 0:
+                continue
+
+            # Credit wallet
+            referrer.referral_wallet_balance = (referrer.referral_wallet_balance or 0) + amount
+            referrer.save(update_fields=['referral_wallet_balance'])
+
+            WalletTransaction.objects.create(
+                user=referrer,
+                amount=amount,
+                type=WalletTransaction.TYPE_CREDIT,
+                description=f"Referral reward for {referral.referred_user.email}",
+            )
+
+            referral.status = Referral.STATUS_REWARDED
+            referral.rewarded_at = timezone.now()
+            referral.save(update_fields=['status', 'rewarded_at'])
+            credited += 1
+            # Push notification to referrer: wallet credited
+            try:
+                from backend.fcm_utils import send_fcm_to_user
+                amount_int = int(amount)
+                send_fcm_to_user(
+                    referrer,
+                    'Wallet credited 💰',
+                    f'₹{amount_int} has been credited to your referral wallet.',
+                    data={'screen': 'referral', 'type': 'referral_wallet_credited'},
+                )
+            except Exception as e:
+                self.message_user(request, f'Push notification failed: {e}', level=messages.WARNING)
+
+        if credited:
+            self.message_user(request, f"Credited wallet for {credited} referrals.", level=messages.SUCCESS)
+        if skipped_hold:
+            self.message_user(
+                request,
+                f"Skipped {skipped_hold} referrals still in hold period.",
+                level=messages.WARNING,
+            )
+        if not credited and not skipped_hold:
+            self.message_user(request, "No referrals were eligible for credit.", level=messages.INFO)
+
+    approve_and_credit.short_description = "Approve & credit wallet for selected referrals"
+
+    def credit_missing_wallet_repair(self, request, queryset):
+        """
+        Repair: For referrals already marked REWARDED but where the referrer's wallet
+        was never credited (e.g. status was set manually). Credits wallet and creates
+        WalletTransaction so balance and history match the status.
+        """
+        repaired = 0
+        for referral in queryset.select_related('referrer', 'referred_user'):
+            if referral.status != Referral.STATUS_REWARDED:
+                continue
+            referrer = referral.referrer
+            if not referrer or referrer.is_banned:
+                continue
+            amount = referral.reward_amount
+            if not amount or amount <= 0:
+                continue
+            # Check if we already have a matching credit (same user, amount, description pattern)
+            desc_substr = referral.referred_user.email or str(referral.referred_user_id)
+            already = WalletTransaction.objects.filter(
+                user=referrer,
+                type=WalletTransaction.TYPE_CREDIT,
+                amount=amount,
+                description__icontains=desc_substr,
+            ).exists()
+            if already:
+                continue
+
+            referrer.referral_wallet_balance = (referrer.referral_wallet_balance or 0) + amount
+            referrer.save(update_fields=['referral_wallet_balance'])
+            WalletTransaction.objects.create(
+                user=referrer,
+                amount=amount,
+                type=WalletTransaction.TYPE_CREDIT,
+                description=f"Referral reward for {referral.referred_user.email}",
+            )
+            repaired += 1
+            # Push notification to referrer: wallet credited (repair)
+            try:
+                from backend.fcm_utils import send_fcm_to_user
+                amount_int = int(amount)
+                send_fcm_to_user(
+                    referrer,
+                    'Wallet credited 💰',
+                    f'₹{amount_int} has been credited to your referral wallet.',
+                    data={'screen': 'referral', 'type': 'referral_wallet_credited'},
+                )
+            except Exception as e:
+                self.message_user(request, f'Push notification failed: {e}', level=messages.WARNING)
+
+        if repaired:
+            self.message_user(
+                request,
+                f"Repaired: credited wallet for {repaired} referral(s) that were marked Rewarded but had no wallet credit.",
+                level=messages.SUCCESS,
+            )
+        else:
+            self.message_user(
+                request,
+                "No referrals needed repair (either not Rewarded or already have a matching wallet credit).",
+                level=messages.INFO,
+            )
+
+    credit_missing_wallet_repair.short_description = "Credit missing wallet (repair rewarded referrals)"
+
+    def reject_referrals(self, request, queryset):
+        updated = queryset.exclude(status=Referral.STATUS_REWARDED).update(
+            status=Referral.STATUS_REJECTED
+        )
+        self.message_user(request, f"Rejected {updated} referrals.", level=messages.WARNING)
+
+    reject_referrals.short_description = "Reject selected referrals"
+
+
+@register(WalletTransaction)
+class WalletTransactionAdmin(admin.ModelAdmin):
+    list_display = ['id', 'user', 'type', 'amount', 'description', 'created_at']
+    list_filter = ['type', 'created_at']
+    search_fields = ['user__email', 'description']
+    autocomplete_fields = ['user', 'order', 'service_booking']
+
+
 # admin.py - Updated ProductAdmin (replace the existing ProductAdmin class)
 
 @register(Product)
 class ProductAdmin(admin.ModelAdmin):
     inlines = [ProductOptionInline]
     list_display = ['id', 'vendor', 'category', 'title', 'position',
-                    'options_pricing_preview', 'delivery_charge', 'cod', 'created_at', 'updated_at']
+                    'options_pricing_preview', 'delivery_charge', 'security_amount', 'cod', 'created_at', 'updated_at']
     readonly_fields = ['star_1', 'star_2', 'star_3', 'star_4', 'star_5', 'options_pricing_overview']
     list_filter = ['cod', 'category', 'vendor', 'requires_date_selection']
     search_fields = ['id', 'title', 'vendor__name', 'vendor__vendor_id']
@@ -171,7 +820,7 @@ class ProductAdmin(admin.ModelAdmin):
             'description': 'Ã¢Å¡ Ã¯Â¸Â Fallback purchase prices. Set ProductOption pricing for actual purchase rates.'
         }),
         ('Ã°Å¸Å¡Å¡ Delivery Settings', {
-            'fields': ('delivery_charge', 'cod'),
+            'fields': ('delivery_charge', 'security_amount', 'cod'),
             'description': 'Ã¢Å“â€¦ Delivery charge and Cash on Delivery availability'
         }),
         ('Ã°Å¸Å½Â¯ Product Options Pricing Overview', {
@@ -1214,10 +1863,54 @@ class ProductBookingInline(admin.TabularInline):
         return False
 
 
+@register(Coupon)
+class CouponAdmin(admin.ModelAdmin):
+    list_display = [
+        'code', 'discount_type', 'discount_value', 'minimum_order_amount',
+        'maximum_discount_amount', 'is_active', 'valid_from', 'valid_until',
+        'usage_limit', 'used_count', 'first_order_only', 'created_at'
+    ]
+    list_filter = ['is_active', 'discount_type', 'first_order_only']
+    search_fields = ['code', 'description']
+    filter_horizontal = ['applicable_products', 'applicable_categories']
+    autocomplete_fields = ['applicable_services']
+    readonly_fields = ['used_count', 'created_at', 'updated_at']
+    date_hierarchy = 'valid_until'
+    fieldsets = (
+        (None, {
+            'fields': ('code', 'description', 'is_active')
+        }),
+        ('Discount', {
+            'fields': ('discount_type', 'discount_value', 'minimum_order_amount', 'maximum_discount_amount')
+        }),
+        ('Validity', {
+            'fields': ('valid_from', 'valid_until', 'usage_limit', 'used_count')
+        }),
+        ('Restrictions', {
+            'fields': ('first_order_only', 'applicable_products', 'applicable_categories', 'applicable_services')
+        }),
+        ('Timestamps', {
+            'fields': ('created_at', 'updated_at')
+        }),
+    )
+
+
+@register(CouponUsage)
+class CouponUsageAdmin(admin.ModelAdmin):
+    list_display = ['id', 'user', 'coupon', 'order', 'service_booking', 'used_at']
+    list_filter = ['coupon', 'used_at']
+    search_fields = ['user__email', 'coupon__code', 'order__id', 'service_booking__id']
+    readonly_fields = ['user', 'coupon', 'order', 'service_booking', 'used_at']
+    ordering = ['-used_at']
+
+    def has_add_permission(self, request):
+        return False
+
+
 @register(Order)
 class OrderAdmin(admin.ModelAdmin):
     inlines = [OrderedProductInline,ProductBookingInline]
-    list_display = ['id','seen', 'user', 'tx_amount', 'payment_mode', 'address', 'tx_id', 'tx_status', 'tx_time', 'tx_msg',
+    list_display = ['id','seen', 'user', 'tx_amount', 'discount_amount', 'coupon', 'payment_mode', 'address', 'tx_id', 'tx_status', 'tx_time', 'tx_msg',
                     'from_cart', 'created_at', 'updated_at']
     list_filter = ['payment_mode', 'tx_status', 'from_cart']
     ordering = ['-created_at']
@@ -1972,16 +2665,19 @@ class VendorAdminForm(forms.ModelForm):
 class VendorAdmin(admin.ModelAdmin):
     """Admin panel configuration for Vendor model."""
     form = VendorAdminForm
-    list_display = ['vendor_id', 'name', 'email', 'phone', 'is_active', 'created_at']
+    list_display = ['vendor_id', 'name', 'email', 'phone', 'trial_enabled', 'is_active', 'created_at']
     search_fields = ['vendor_id', 'name', 'email', 'phone', 'gst_number']
-    list_filter = ['is_active', 'created_at', 'updated_at']
+    list_filter = ['trial_enabled', 'is_active', 'created_at', 'updated_at']
     readonly_fields = ['vendor_id', 'created_at', 'updated_at']
     fieldsets = (
         ('Vendor Info', {
-            'fields': ('vendor_id', 'name', 'email', 'phone', 'password')
+            'fields': ('vendor_id', 'name', 'email', 'phone', 'pincode', 'serviceable_locations', 'password')
         }),
         ('Business Details', {
             'fields': ('business_address', 'gst_number')
+        }),
+        ('Trial-at-Home', {
+            'fields': ('trial_enabled',),
         }),
         ('Status', {
             'fields': ('is_active',)
@@ -1997,6 +2693,30 @@ class VendorAdmin(admin.ModelAdmin):
         if raw_password and not raw_password.startswith('pbkdf2_'):
             obj.set_password(raw_password)
         super().save_model(request, obj, form, change)
+
+
+@admin.register(ServiceVendor)
+class ServiceVendorAdmin(admin.ModelAdmin):
+    list_display = ['service_vendor_id', 'name', 'phone', 'area', 'pincode', 'is_active', 'created_at']
+    search_fields = ['service_vendor_id', 'name', 'phone', 'area', 'pincode']
+    list_filter = ['is_active', 'created_at', 'updated_at']
+    readonly_fields = ['service_vendor_id', 'created_at', 'updated_at']
+    filter_horizontal = ['service_subcategories']
+
+
+@register(ServiceVendorToken)
+class ServiceVendorTokenAdmin(admin.ModelAdmin):
+    list_display = ['vendor', 'token_preview', 'created_at']
+    readonly_fields = ['token', 'vendor', 'fcmtoken', 'created_at']
+    search_fields = ['vendor__service_vendor_id', 'vendor__name', 'vendor__phone']
+
+    def token_preview(self, obj):
+        return f"{obj.token[:20]}..."
+
+    token_preview.short_description = 'Token'
+
+    def has_add_permission(self, request):
+        return False
 
 
 

@@ -1,0 +1,226 @@
+{% extends "admin/base_site.html" %}
+
+{% block content %}
+  <h1>Analytics dashboard</h1>
+
+  <div style="margin: 10px 0 18px 0;">
+    <form method="get" style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+      <label>
+        Days:
+        <select name="days">
+          <option value="7" {% if days == 7 %}selected{% endif %}>Last 7 days</option>
+          <option value="14" {% if days == 14 %}selected{% endif %}>Last 14 days</option>
+          <option value="30" {% if days == 30 %}selected{% endif %}>Last 30 days</option>
+          <option value="60" {% if days == 60 %}selected{% endif %}>Last 60 days</option>
+          <option value="90" {% if days == 90 %}selected{% endif %}>Last 90 days</option>
+          <option value="120" {% if days == 120 %}selected{% endif %}>Last 120 days</option>
+        </select>
+      </label>
+      <button class="button" type="submit">Apply</button>
+      <a class="button" href="../">Back to events</a>
+    </form>
+    <p style="margin-top:8px;color:#666;">
+      Range: {{ start_dt }} → {{ end_dt }}
+    </p>
+  </div>
+
+  <style>
+    .grid { display:grid; grid-template-columns: repeat(12, 1fr); gap: 14px; }
+    .card { background:#fff; border:1px solid #e6e6e6; border-radius:12px; padding:14px; }
+    .card h2 { font-size:16px; margin:0 0 8px 0; }
+    .span-6 { grid-column: span 6; }
+    .span-4 { grid-column: span 4; }
+    .span-12 { grid-column: span 12; }
+    @media (max-width: 1100px) { .span-6,.span-4 { grid-column: span 12; } }
+    .kpis { display:flex; gap:12px; flex-wrap:wrap; }
+    .kpi { background:#f8fafc; border:1px solid #eef2f7; border-radius:10px; padding:10px 12px; min-width: 180px; }
+    .kpi .label { color:#64748b; font-size:12px; }
+    .kpi .value { font-size:20px; font-weight:700; margin-top:2px; }
+    table { width:100%; border-collapse:collapse; }
+    th, td { padding:8px; border-bottom:1px solid #eee; text-align:left; }
+  </style>
+
+  <div class="grid">
+    <div class="card span-12">
+      <h2>Quick links</h2>
+      <div class="kpis">
+        <div class="kpi">
+          <div class="label">Raw screen events</div>
+          <div class="value"><a href="../">Open list</a></div>
+        </div>
+        <div class="kpi">
+          <div class="label">Daily app opens</div>
+          <div class="value"><a href="../app-opens/">Open report</a></div>
+        </div>
+        <div class="kpi">
+          <div class="label">Customer location pings</div>
+          <div class="value"><a href="/admin/backend/customerlocationping/">Open list</a></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card span-6">
+      <h2>App opens (daily)</h2>
+      <canvas id="appOpensLine"></canvas>
+    </div>
+
+    <div class="card span-6">
+      <h2>Orders (daily)</h2>
+      <canvas id="ordersLine"></canvas>
+    </div>
+
+    <div class="card span-6">
+      <h2>Top screens by opens</h2>
+      <canvas id="screenOpensBar"></canvas>
+    </div>
+
+    <div class="card span-6">
+      <h2>Time spent by screen (total)</h2>
+      <canvas id="screenTimeBar"></canvas>
+    </div>
+
+    <div class="card span-6">
+      <h2>Orders by payment status</h2>
+      <canvas id="ordersStatusPie"></canvas>
+    </div>
+
+    <div class="card span-6">
+      <h2>Users by city (pincode)</h2>
+      <canvas id="usersCityBar"></canvas>
+    </div>
+
+    <div class="card span-12">
+      <h2>Orders by city (pincode)</h2>
+      <canvas id="ordersCityBar"></canvas>
+    </div>
+
+    <div class="card span-12">
+      <h2>Top screens table</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Screen</th>
+            <th>Opens</th>
+            <th>Total time (sec)</th>
+            <th>Avg time (sec)</th>
+          </tr>
+        </thead>
+        <tbody id="topScreensTable"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+
+  {# Embed JSON safely; JS will parse from these script tags. #}
+  <script id="appOpensSeriesData" type="application/json">{{ app_opens_series_json|safe }}</script>
+  <script id="topScreensData" type="application/json">{{ top_screens_json|safe }}</script>
+  <script id="ordersSeriesData" type="application/json">{{ orders_series_json|safe }}</script>
+  <script id="ordersStatusData" type="application/json">{{ orders_status_json|safe }}</script>
+  <script id="usersByCityData" type="application/json">{{ users_by_city_json|safe }}</script>
+  <script id="ordersByCityData" type="application/json">{{ orders_by_city_json|safe }}</script>
+
+  <script>
+    const appOpensSeries = JSON.parse(document.getElementById('appOpensSeriesData').textContent || '[]');
+    const topScreens = JSON.parse(document.getElementById('topScreensData').textContent || '[]');
+    const ordersSeries = JSON.parse(document.getElementById('ordersSeriesData').textContent || '[]');
+    const ordersStatus = JSON.parse(document.getElementById('ordersStatusData').textContent || '[]');
+    const usersByCity = JSON.parse(document.getElementById('usersByCityData').textContent || '[]');
+    const ordersByCity = JSON.parse(document.getElementById('ordersByCityData').textContent || '[]');
+
+    function lineChart(ctx, labels, values, label) {
+      return new Chart(ctx, {
+        type: 'line',
+        data: { labels, datasets: [{ label, data: values, borderColor: '#2563eb', backgroundColor: 'rgba(37, 99, 235, 0.15)', tension: 0.25, fill: true }]},
+        options: { responsive:true, plugins:{ legend:{ display:true }}, scales:{ y:{ beginAtZero:true } } }
+      });
+    }
+
+    function barChart(ctx, labels, values, label, color) {
+      return new Chart(ctx, {
+        type: 'bar',
+        data: { labels, datasets: [{ label, data: values, backgroundColor: color || 'rgba(16, 185, 129, 0.6)'}]},
+        options: { responsive:true, plugins:{ legend:{ display:true }}, scales:{ y:{ beginAtZero:true } } }
+      });
+    }
+
+    function pieChart(ctx, labels, values) {
+      return new Chart(ctx, {
+        type: 'pie',
+        data: { labels, datasets: [{ data: values, backgroundColor: ['#2563eb','#10b981','#f59e0b','#ef4444','#8b5cf6','#06b6d4','#64748b','#fb7185'] }]},
+        options: { responsive:true, plugins:{ legend:{ position:'bottom' } } }
+      });
+    }
+
+    // App opens line
+    lineChart(
+      document.getElementById('appOpensLine'),
+      appOpensSeries.map(x => x.day),
+      appOpensSeries.map(x => x.opens),
+      'App opens'
+    );
+
+    // Orders line
+    lineChart(
+      document.getElementById('ordersLine'),
+      ordersSeries.map(x => x.day),
+      ordersSeries.map(x => x.orders),
+      'Orders'
+    );
+
+    // Screen opens bar
+    barChart(
+      document.getElementById('screenOpensBar'),
+      topScreens.map(x => x.screen),
+      topScreens.map(x => x.opens),
+      'Opens',
+      'rgba(59, 130, 246, 0.6)'
+    );
+
+    // Screen total time bar
+    barChart(
+      document.getElementById('screenTimeBar'),
+      topScreens.map(x => x.screen),
+      topScreens.map(x => Math.round(x.total_seconds || 0)),
+      'Total seconds',
+      'rgba(16, 185, 129, 0.6)'
+    );
+
+    // Orders status pie
+    pieChart(
+      document.getElementById('ordersStatusPie'),
+      ordersStatus.map(x => x.status),
+      ordersStatus.map(x => x.count)
+    );
+
+    // Users by city bar
+    barChart(
+      document.getElementById('usersCityBar'),
+      usersByCity.map(x => x.city),
+      usersByCity.map(x => x.count),
+      'Users',
+      'rgba(245, 158, 11, 0.6)'
+    );
+
+    // Orders by city bar
+    barChart(
+      document.getElementById('ordersCityBar'),
+      ordersByCity.map(x => x.city),
+      ordersByCity.map(x => x.count),
+      'Orders',
+      'rgba(139, 92, 246, 0.6)'
+    );
+
+    // Table
+    const tbody = document.getElementById('topScreensTable');
+    tbody.innerHTML = topScreens.map(r => (
+      `<tr>
+        <td>${r.screen}</td>
+        <td>${r.opens}</td>
+        <td>${Math.round(r.total_seconds || 0)}</td>
+        <td>${(r.avg_seconds || 0).toFixed(1)}</td>
+      </tr>`
+    )).join('');
+  </script>
+{% endblock %}
+
