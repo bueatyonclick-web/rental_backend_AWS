@@ -2,4 +2,4 @@
 entrypoint = "core.wsgi:application"
 
 [tool.vercel.scripts]
-build = "bash build_files.sh"
+build = "python manage.py collectstatic --noinput"

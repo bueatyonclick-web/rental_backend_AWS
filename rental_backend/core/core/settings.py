@@ -165,7 +165,7 @@ STORAGES = {
         'BACKEND': 'django.core.files.storage.FileSystemStorage',
     },
     'staticfiles': {
-        'BACKEND': 'whitenoise.storage.CompressedManifestStaticFilesStorage',
+        'BACKEND': 'whitenoise.storage.CompressedStaticFilesStorage',
     },
 }
 
@@ -188,22 +188,26 @@ MEDIA_ROOT =os.path.join(BASE_DIR,'media')
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
-TEMPLATES_BASE_URL = 'https://clickwelladmin.pythonanywhere.com' #https://127.0.0.1:8000
-
+TEMPLATES_BASE_URL = os.environ.get(
+    'TEMPLATES_BASE_URL',
+    'https://clickwelladmin.pythonanywhere.com',
+)
 
 EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
-EMAIL_HOST = 'smtp-relay.brevo.com'
+EMAIL_HOST = os.environ.get('EMAIL_HOST', 'smtp-relay.brevo.com')
 EMAIL_USE_TLS = True
-EMAIL_PORT = 587
-EMAIL_HOST_USER = 'clickwell2005@gmail.com'
-EMAIL_HOST_PASSWORD = 'TwQ5OsXc3VASmhvj'
+EMAIL_PORT = int(os.environ.get('EMAIL_PORT', '587'))
+EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', 'clickwell2005@gmail.com')
+EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', 'TwQ5OsXc3VASmhvj')
 
 CORS_ALLOWED_ORIGINS = [
-    "http://10.0.2.2:8000",
-    "http://127.0.0.1:8000",
-    "http://10.154.252.150:8000",  # Physical device / same network
-    "http://89.117.157.199",
-    "http://192.168.29.118",
+    origin.strip()
+    for origin in os.environ.get(
+        'CORS_ALLOWED_ORIGINS',
+        'http://10.0.2.2:8000,http://127.0.0.1:8000,http://10.154.252.150:8000,'
+        'http://89.117.157.199,http://192.168.29.118',
+    ).split(',')
+    if origin.strip()
 ]
 
 REST_FRAMEWORK = {
@@ -216,12 +220,15 @@ REST_FRAMEWORK = {
 }
 
 
-FAST2SMS_API_KEY = "MzkN1BbwZKQvPk2JuEbyS9rFr6gKF7OsNVUYtMXUBVyGLoPubFugUzNDSfCa "
+FAST2SMS_API_KEY = os.environ.get(
+    'FAST2SMS_API_KEY',
+    'MzkN1BbwZKQvPk2JuEbyS9rFr6gKF7OsNVUYtMXUBVyGLoPubFugUzNDSfCa ',
+)
 
-
-
-
-TWO_FACTOR_API_KEY = "373a716f-a4fa-11f0-b922-0200cd936042"
+TWO_FACTOR_API_KEY = os.environ.get(
+    'TWO_FACTOR_API_KEY',
+    '373a716f-a4fa-11f0-b922-0200cd936042',
+)
 
 # HyperSender WhatsApp API (OTP via WhatsApp instead of SMS)
 # Get from https://app.hypersender.com - use env vars in production
@@ -277,15 +284,23 @@ logger = logging.getLogger(__name__)
 logger.info(f"APNs Certificate Path: {APNS_CA_CERT_PATH}")
 
 # FCM push notifications (e.g. when vendor accepts order).
+import json
+
 import firebase_admin
 from firebase_admin import credentials
+
 _FIREBASE_JSON = os.path.join(str(BASE_DIR), 'backend', 'beautyonclick-45c23-firebase-adminsdk-fbsvc-e78a918a62.json')
-if os.path.isfile(_FIREBASE_JSON):
+_FIREBASE_ENV = os.environ.get('FIREBASE_CREDENTIALS_JSON', '').strip()
+
+if _FIREBASE_ENV:
+    FIREBASE_ADMIN_CREDENTIALS = credentials.Certificate(json.loads(_FIREBASE_ENV))
+    print('FCM: Credentials loaded from FIREBASE_CREDENTIALS_JSON env var')
+elif os.path.isfile(_FIREBASE_JSON):
     FIREBASE_ADMIN_CREDENTIALS = credentials.Certificate(_FIREBASE_JSON)
     print(f'FCM: Credentials loaded from {_FIREBASE_JSON}')
 else:
     FIREBASE_ADMIN_CREDENTIALS = None
-    print(f'FCM: No credentials file at {_FIREBASE_JSON} - push notifications disabled')
+    print('FCM: No Firebase credentials configured - push notifications disabled')
 
 
 
