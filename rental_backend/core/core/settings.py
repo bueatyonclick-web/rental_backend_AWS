@@ -34,10 +34,21 @@ ALLOWED_HOSTS = [
     '127.0.0.1',
     'localhost',
     '10.0.2.2',
+    '13.205.169.178',  # AWS EC2
 ]
 _extra_hosts = os.environ.get('DJANGO_ALLOWED_HOSTS', '')
 if _extra_hosts:
     ALLOWED_HOSTS.extend(h.strip() for h in _extra_hosts.split(',') if h.strip())
+
+CSRF_TRUSTED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get(
+        'CSRF_TRUSTED_ORIGINS',
+        'http://13.205.169.178,http://13.205.169.178:8000,'
+        'https://13.205.169.178,https://13.205.169.178:8000',
+    ).split(',')
+    if origin.strip()
+]
 
 # Application definition
 
@@ -205,7 +216,8 @@ CORS_ALLOWED_ORIGINS = [
     for origin in os.environ.get(
         'CORS_ALLOWED_ORIGINS',
         'http://10.0.2.2:8000,http://127.0.0.1:8000,http://10.154.252.150:8000,'
-        'http://89.117.157.199,http://192.168.29.118',
+        'http://89.117.157.199,http://192.168.29.118,'
+        'http://13.205.169.178,http://13.205.169.178:8000',
     ).split(',')
     if origin.strip()
 ]
